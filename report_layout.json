@@ -1,0 +1,8 @@
+{
+  "title": "📊 {date} 台股開盤報告",
+  "global_indices": "🌐 全球市場：",
+  "stock_tracking": "🏛️ 台股重點：",
+  "volume_tracking": "🔥 成交量最大股票：",
+  "news_summary": "💡 相關產業研究：",
+  "suggestions": "🚨 其他熱門產業推薦："
+}

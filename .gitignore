@@ -1,0 +1,27 @@
+# Local databases and logs
+market_history.db
+market_report_data.json
+market_report.md
+twse_data.json
+twse_daily_report.md
+
+# Python
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+
+# Local config changes (optional, but good to have)
+# tracked_stocks.json
+# news_config.json
+# report_layout.json
+
+# Node modules
+node_modules/
+package-lock.json
+
+# Credentials/Secrets
+.env
+secret.json
+gemini.js
+gemini.js
