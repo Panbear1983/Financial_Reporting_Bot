@@ -29,6 +29,9 @@ This system is designed to run silently in the background, executing precise, da
 *   Every generated report is permanently archived locally.
 *   **Formats Supported:** Markdown (`.md`), structured JSON (`.json`), and long-term storage in a local SQLite database (`market_history.db`).
 
+### 5. Ecosystem Plugins
+*   **[Gemini Token Status Hook](https://github.com/Panbear1983/gemini-token-status):** A custom telemetry plugin for the Gemini CLI that provides real-time "Gas Gauge" monitoring of AI context window usage. Integrated seamlessly to ensure Agentic workflows stay within their cognitive limits.
+
 ---
 
 ## 📁 Architecture & File Structure
