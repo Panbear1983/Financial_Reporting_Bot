@@ -1014,6 +1014,61 @@ def _edit_news(cfg):
         news['count'] = int(c)
 
 
+def _menu_stock_notes(cfg):
+    """Per-stock notes — free-text annotations rendered under each holding in the report."""
+    notes = cfg.setdefault('notes', {})
+    portfolio = load_json(_config_path('portfolio.json')) or {}
+    tracked   = load_json(_config_path('tracked_stocks.json')) or {}
+    name_of = {code: pos.get('name', code) for code, pos in portfolio.items()}
+    for code, name in tracked.items():
+        name_of.setdefault(code, name)
+    while True:
+        header('Per-stock Notes — shown under each holding (📝)')
+        t = Table(box=box.ROUNDED)
+        t.add_column('Code', style='cyan', width=8)
+        t.add_column('Name', width=14)
+        t.add_column('Note')
+        for code in sorted(set(name_of) | set(notes)):
+            t.add_row(code, name_of.get(code, '—'), notes.get(code) or '[dim]—[/dim]')
+        console.print(t)
+        console.print('\n[cyan][a][/cyan] Add/Edit  [cyan][d][/cyan] Delete  [cyan][b][/cyan] Back')
+        choice = Prompt.ask('Action', choices=['a', 'd', 'b'], default='b')
+        if choice == 'a':
+            code = Prompt.ask('Stock code').strip()
+            if code:
+                text = Prompt.ask('Note (blank to clear)', default=notes.get(code, '')).strip()
+                if text:
+                    notes[code] = text
+                else:
+                    notes.pop(code, None)
+                save_bot_config(cfg)
+                console.print('[green]✓ Saved.[/green]')
+            pause()
+        elif choice == 'd':
+            code = Prompt.ask('Code to remove note').strip()
+            if notes.pop(code, None) is not None:
+                save_bot_config(cfg)
+                console.print(f'[green]✓ Removed note for {code}.[/green]')
+            else:
+                console.print('[yellow]No note for that code.[/yellow]')
+            pause()
+        else:
+            break
+
+
+def _edit_report_style(cfg):
+    """Custom header (above the report title) and footer (at the very bottom) text."""
+    style = cfg.setdefault('report_style', {})
+    header('Header / Footer — custom text wrapping the report')
+    console.print('[dim]Header prints above the 📊 title line; footer at the very bottom. '
+                  'Applies to both morning + closing. Blank to clear.[/dim]\n')
+    style['header'] = Prompt.ask('Header text', default=style.get('header', '')).strip()
+    style['footer'] = Prompt.ask('Footer text', default=style.get('footer', '')).strip()
+    save_bot_config(cfg)
+    console.print('[green]✓ Header/footer saved.[/green]')
+    pause()
+
+
 def menu_report_layout():
     while True:
         cfg = load_json(_config_path('bot_config.json'))
@@ -1046,10 +1101,12 @@ def menu_report_layout():
                       '[cyan][2][/cyan] Edit Closing sections  '
                       '[cyan][3][/cyan] Reorder sections')
         console.print('[cyan][4][/cyan] Manage Global Indices  '
-                      '[cyan][5][/cyan] News settings  '
+                      '[cyan][5][/cyan] News settings')
+        console.print('[cyan][6][/cyan] Per-stock notes  '
+                      '[cyan][7][/cyan] Header/Footer text  '
                       '[cyan][r][/cyan] Revert to last good  '
                       '[cyan][b][/cyan] Back')
-        choice = Prompt.ask('Action', choices=['1','2','3','4','5','r','b'], default='b')
+        choice = Prompt.ask('Action', choices=['1','2','3','4','5','6','7','r','b'], default='b')
 
         if choice == '1':
             _edit_sections(MORNING_SECTION_LABELS, cfg['sections']['morning'])
@@ -1079,6 +1136,10 @@ def menu_report_layout():
             save_bot_config(cfg)
             console.print('[green]✓ News settings saved.[/green]')
             pause()
+        elif choice == '6':
+            _menu_stock_notes(cfg)
+        elif choice == '7':
+            _edit_report_style(cfg)
         elif choice == 'r':
             if restore_bot_config_bak():
                 console.print('[green]✓ Reverted bot_config.json to last-known-good (.bak).[/green]')

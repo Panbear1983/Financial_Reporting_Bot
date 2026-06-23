@@ -75,6 +75,17 @@ def _resolve_section_order(cfg_order, default_order):
     return final
 
 
+def _stock_note(cfg, code):
+    """Optional per-stock annotation (bot_config['notes'][code]), shown under a holding."""
+    note = (cfg.get('notes') or {}).get(str(code))
+    return f"\n  📝 {note.strip()}" if note and str(note).strip() else ""
+
+
+def _style_text(cfg, key):
+    """Optional custom header/footer text (bot_config['report_style'][key])."""
+    return ((cfg.get('report_style') or {}).get(key, '') or '').strip()
+
+
 def format_portfolio_line(shares, cost_basis, scraped_close):
     # 現值 = 股數 × TWSE/TPEX 收盤價 (scraped)
     # 預估損益 = 現值 - 付出成本 (formula)
@@ -559,6 +570,7 @@ def generate_morning_report():
                 pass
             if reason:
                 line += f"\n  展望：{reason}"
+            line += _stock_note(cfg, code)
             holding_sections.append(line)
             holding_sections.append("")
             stock_summary.append(f"{name}({code}) {direction}{abs(pct):.1f}%")
@@ -656,6 +668,10 @@ def generate_morning_report():
         blocks['ai_outlook'] = [f"💡 開盤展望：\n{outlook}"]
 
     lines = []
+    style_header = _style_text(cfg, 'header')
+    if style_header:
+        lines.append(style_header)
+        lines.append("")
     lines.append(f"📊 {date_str} 台股開盤快報（{time_str} 數據）")
     lines.append(f"⚠️ 數據來源：Yahoo Finance（TWSE官方數據於收盤後發布）")
     lines.append("")
@@ -665,6 +681,11 @@ def generate_morning_report():
             ['market_overview', 'global_markets', 'holdings', 'watchlist', 'ai_outlook']):
         if sections.get(key, True) and key in blocks:
             lines.extend(blocks[key])
+
+    style_footer = _style_text(cfg, 'footer')
+    if style_footer:
+        lines.append("")
+        lines.append(style_footer)
 
     report = "\n".join(lines)
     _save_and_print(report, output_dir, 'twse_daily_report.md')
@@ -769,6 +790,7 @@ def generate_closing_report():
             pass
         if reason:
             line += f"\n    原因：{reason}"
+        line += _stock_note(cfg, code)
         holding_sections.append(line)
         holding_sections.append("")
 
@@ -896,6 +918,10 @@ def generate_closing_report():
         blocks['ai_research'] = ai_block
 
     lines = []
+    style_header = _style_text(cfg, 'header')
+    if style_header:
+        lines.append(style_header)
+        lines.append("")
     lines.append(f"📊 {date_str} 台股收盤報告（{time_str} 數據）")
     if data_is_stale:
         lines.append(f"⚠️ 注意：TWSE尚未發布今日數據，以下為最近交易日（{twse_date_raw}）數據")
@@ -907,6 +933,11 @@ def generate_closing_report():
             ['market_overview', 'global_markets', 'hotlist', 'holdings', 'watchlist', 'news', 'ai_research']):
         if sections.get(key, True) and key in blocks:
             lines.extend(blocks[key])
+
+    style_footer = _style_text(cfg, 'footer')
+    if style_footer:
+        lines.append("")
+        lines.append(style_footer)
 
     report = "\n".join(lines)
     _save_and_print(report, output_dir, 'twse_daily_report.md')
