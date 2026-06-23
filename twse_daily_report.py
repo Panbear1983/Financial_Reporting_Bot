@@ -199,6 +199,59 @@ def send_telegram_report(text):
             print(f"[{_now()}] Telegram error: {e}")
 
 
+def _send_telegram(token, chat_id, text):
+    """Send one report to one Telegram destination (chunked at 4000). Returns bool."""
+    if not token or not chat_id:
+        print(f"[{_now()}] Telegram destination missing token/chat_id, skipping.")
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    ok_all = True
+    for chunk in [text[i:i + 4000] for i in range(0, len(text), 4000)]:
+        try:
+            resp = requests.post(
+                url, json={"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"},
+                timeout=15)
+            if resp.ok:
+                print(f"[{_now()}] Telegram sent → {chat_id}.")
+            else:
+                print(f"[{_now()}] Telegram failed ({chat_id}): {resp.text}")
+                ok_all = False
+        except Exception as e:
+            print(f"[{_now()}] Telegram error ({chat_id}): {e}")
+            ok_all = False
+    return ok_all
+
+
+def deliver_report(text, cfg=None):
+    """Deliver the report to every enabled channel in cfg['delivery']['channels'].
+
+    Backward compatible: when no channels are configured, falls back to the single
+    env-based Telegram destination (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID). Telegram
+    channels can each name their own token env var + chat_id, so multiple bots / group
+    chats are supported. LINE / WhatsApp channels are config placeholders meant to be
+    routed through OpenClaw — OpenClaw has no messaging gateway yet, so they are logged
+    and skipped (never silently faked as delivered)."""
+    if os.getenv('SANDBOX_MODE', '').lower() == 'true':
+        _render_sandbox(text)
+        return
+    if cfg is None:
+        cfg = load_bot_config()
+    channels = [c for c in (cfg.get('delivery', {}) or {}).get('channels', []) if c.get('enabled', True)]
+    if not channels:
+        _send_telegram(os.getenv('TELEGRAM_BOT_TOKEN'), os.getenv('TELEGRAM_CHAT_ID'), text)
+        return
+    for ch in channels:
+        ctype = (ch.get('type') or 'telegram').lower()
+        name  = ch.get('name', ctype)
+        if ctype == 'telegram':
+            token   = os.getenv(ch.get('token_env', 'TELEGRAM_BOT_TOKEN')) or os.getenv('TELEGRAM_BOT_TOKEN')
+            chat_id = ch.get('chat_id') or os.getenv('TELEGRAM_CHAT_ID')
+            _send_telegram(token, chat_id, text)
+        else:
+            print(f"[{_now()}] Channel '{name}' (type={ctype}) configured but OpenClaw has no "
+                  f"{ctype} gateway yet — skipped, not sent.")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -418,15 +471,25 @@ def fetch_period_returns(code):
         return {}
 
 
+RETURN_FLAG_PCT = 500.0  # |return| beyond this gets a ⚠ verify-flag
+
+
 def _returns_line(code):
-    """Render the watchlist 績效 strip (1月/3月/1年). Empty string when no data."""
+    """Render the watchlist 績效 strip (1月/3月/1年). Empty string when no data.
+    Returns beyond ±RETURN_FLAG_PCT are marked ⚠ — usually a real low-base 興櫃 move,
+    but flagged so a sparse/erroneous early bar isn't taken at face value."""
     rets = fetch_period_returns(code)
     if not rets:
         return ""
     parts = []
     for label in ('1月', '3月', '1年'):
         v = rets.get(label)
-        parts.append(f"{label} {v:+.1f}%" if v is not None else f"{label} N/A")
+        if v is None:
+            parts.append(f"{label} N/A")
+        elif abs(v) > RETURN_FLAG_PCT:
+            parts.append(f"{label} {v:+.0f}%⚠")
+        else:
+            parts.append(f"{label} {v:+.1f}%")
     return "\n  績效：" + " · ".join(parts)
 
 
@@ -470,8 +533,8 @@ def _src_tag(row):
 # OpenRouter — text only, numbers always provided via prompt context
 # ---------------------------------------------------------------------------
 
-def call_openrouter(prompt, max_tokens=200, model='anthropic/claude-haiku-3-5'):
-    api_key = os.getenv('OPENROUTER_API_KEY')
+def call_openrouter(prompt, max_tokens=200, model='anthropic/claude-haiku-3-5', api_key=None):
+    api_key = api_key or os.getenv('OPENROUTER_API_KEY')
     if not api_key:
         return ''
     try:
@@ -493,6 +556,33 @@ def call_openrouter(prompt, max_tokens=200, model='anthropic/claude-haiku-3-5'):
     except Exception as e:
         print(f"[{_now()}] OpenRouter error: {e}")
     return ''
+
+
+def ai_report_summary(report_text, cfg):
+    """One AI pass over the fully-compiled report → a 報告總結 analyst conclusion.
+
+    Pluggable summarization engine: ai.summary_model (falls back to ai.model) and
+    ai.summary_key_env (which env var holds the OpenRouter key, default
+    OPENROUTER_API_KEY) — so the user can point the summary at a different model/key
+    than the per-stock reasoning. Returns '' on any failure or when the engine is
+    unconfigured, so a bad/empty AI call can never blank the report."""
+    ai_cfg     = cfg.get('ai', {})
+    model      = ai_cfg.get('summary_model') or ai_cfg.get('model', 'anthropic/claude-haiku-3-5')
+    max_tokens = int(ai_cfg.get('max_tokens_summary', 400) or 400)
+    key_env    = ai_cfg.get('summary_key_env', 'OPENROUTER_API_KEY')
+    api_key    = os.getenv(key_env) or os.getenv('OPENROUTER_API_KEY')
+    prompt = (
+        "你是一位專業的台股分析師。以下是今日自動產生的完整台股報告，"
+        "請根據其中的數據（持倉、觀察清單、技術指標、全球市場、財經新聞）"
+        "撰寫一段精簡的「報告總結」：點出今日重點、持倉整體狀況、觀察清單值得注意之處、"
+        "以及需留意的風險。請用繁體中文，3-5 句或條列，避免重複原文的逐項數字。\n\n"
+        f"=== 報告內容 ===\n{report_text}\n=== 報告結束 ==="
+    )
+    try:
+        return call_openrouter(prompt, max_tokens=max_tokens, model=model, api_key=api_key)
+    except Exception as e:
+        print(f"[{_now()}] Report-summary error: {e}")
+        return ''
 
 
 def fetch_brave_news(query='台股 今日 財經', count=5):
@@ -760,6 +850,13 @@ def generate_morning_report():
         if sections.get(key, True) and key in blocks:
             lines.extend(blocks[key])
 
+    if sections.get('report_summary', True):
+        _summary = ai_report_summary("\n".join(lines), cfg)
+        if _summary:
+            lines.append("")
+            lines.append("📋 **報告總結（AI 分析師）：**")
+            lines.append(_summary)
+
     style_footer = _style_text(cfg, 'footer')
     if style_footer:
         lines.append("")
@@ -1013,6 +1110,13 @@ def generate_closing_report():
         if sections.get(key, True) and key in blocks:
             lines.extend(blocks[key])
 
+    if sections.get('report_summary', True):
+        _summary = ai_report_summary("\n".join(lines), cfg)
+        if _summary:
+            lines.append("")
+            lines.append("📋 **報告總結（AI 分析師）：**")
+            lines.append(_summary)
+
     style_footer = _style_text(cfg, 'footer')
     if style_footer:
         lines.append("")
@@ -1048,7 +1152,7 @@ def generate_daily_report(mode='closing', send=True):
     else:
         report = generate_closing_report()
     if report and send:
-        send_telegram_report(report)
+        deliver_report(report)
 
 
 if __name__ == '__main__':

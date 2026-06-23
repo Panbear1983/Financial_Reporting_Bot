@@ -139,7 +139,8 @@ def _sanitize_bot_config(cfg):
     """Mutate cfg in place, clamping numeric fields to safe ranges."""
     ai = cfg.get('ai')
     if isinstance(ai, dict):
-        for k in ('max_tokens_reason', 'max_tokens_outlook', 'max_tokens_research'):
+        for k in ('max_tokens_reason', 'max_tokens_outlook', 'max_tokens_research',
+                  'max_tokens_summary'):
             if k in ai:
                 c = _clamp(ai[k], 1, 4000)
                 if c is not None:
@@ -759,11 +760,13 @@ def menu_sandbox():
 # [6] AI Settings
 # ---------------------------------------------------------------------------
 
+# Verified valid on OpenRouter (2026-06). The old 'anthropic/claude-haiku-3-5'
+# id was invalid (HTTP 400) — it silently no-op'd every AI call.
 AVAILABLE_MODELS = [
-    'anthropic/claude-haiku-3-5',
-    'anthropic/claude-sonnet-4',
+    'anthropic/claude-haiku-4.5',
+    'anthropic/claude-3-haiku',
+    'google/gemini-2.5-flash-lite-preview-09-2025',
     'deepseek/deepseek-chat',
-    'google/gemini-2.0-flash-001',
 ]
 
 
@@ -781,6 +784,9 @@ def menu_ai_settings():
         t.add_row('Max tokens — 個股原因 (reason)',   str(ai.get('max_tokens_reason', 100)))
         t.add_row('Max tokens — 開盤展望 (outlook)',  str(ai.get('max_tokens_outlook', 200)))
         t.add_row('Max tokens — 收盤研究 (research)', str(ai.get('max_tokens_research', 350)))
+        t.add_row('Max tokens — 報告總結 (summary)',  str(ai.get('max_tokens_summary', 400)))
+        t.add_row('Summary model (報告總結)',          ai.get('summary_model') or '(uses Model)')
+        t.add_row('Summary key env',                  ai.get('summary_key_env', 'OPENROUTER_API_KEY'))
         console.print(t)
         console.print()
 
@@ -794,8 +800,9 @@ def menu_ai_settings():
         console.print(t2)
 
         console.print('\n[cyan][1][/cyan] Edit model  [cyan][2][/cyan] Edit token limits  '
-                      '[cyan][3][/cyan] Edit thresholds  [cyan][b][/cyan] Back')
-        choice = Prompt.ask('Action', choices=['1','2','3','b'], default='b')
+                      '[cyan][3][/cyan] Edit thresholds  [cyan][4][/cyan] Summary engine  '
+                      '[cyan][b][/cyan] Back')
+        choice = Prompt.ask('Action', choices=['1','2','3','4','b'], default='b')
 
         if choice == '1':
             console.print('\nAvailable models:')
@@ -814,7 +821,8 @@ def menu_ai_settings():
         elif choice == '2':
             for key, label in [('max_tokens_reason', '個股原因'),
                                 ('max_tokens_outlook', '開盤展望'),
-                                ('max_tokens_research', '收盤研究')]:
+                                ('max_tokens_research', '收盤研究'),
+                                ('max_tokens_summary', '報告總結')]:
                 val = Prompt.ask(f'{label} max_tokens', default=str(ai.get(key, 100)))
                 try:
                     ai[key] = int(val)
@@ -836,6 +844,34 @@ def menu_ai_settings():
                     console.print(f'[red]Invalid value for {label}, skipped.[/red]')
             save_bot_config(cfg)
             console.print('[green]✓ Thresholds saved.[/green]')
+            pause()
+
+        elif choice == '4':
+            console.print('\n[bold]報告總結 (Report Summary) engine[/bold] — '
+                          'the AI pass that summarizes the whole compiled report.')
+            console.print('[dim]Pick a model (blank = reuse the main Model above), the env var '
+                          'holding its OpenRouter key, and a token budget.[/dim]')
+            for i, m in enumerate(AVAILABLE_MODELS, 1):
+                console.print(f'  [{i}] {m}')
+            sel = Prompt.ask('Summary model # / custom id / blank = use Model',
+                             default=ai.get('summary_model', ''))
+            if sel.isdigit() and 1 <= int(sel) <= len(AVAILABLE_MODELS):
+                ai['summary_model'] = AVAILABLE_MODELS[int(sel) - 1]
+            elif sel.strip():
+                ai['summary_model'] = sel.strip()
+            else:
+                ai.pop('summary_model', None)
+            key_env = Prompt.ask('Summary API key env var',
+                                 default=ai.get('summary_key_env', 'OPENROUTER_API_KEY')).strip()
+            ai['summary_key_env'] = key_env or 'OPENROUTER_API_KEY'
+            tok = Prompt.ask('報告總結 max_tokens', default=str(ai.get('max_tokens_summary', 400)))
+            try:
+                ai['max_tokens_summary'] = int(tok)
+            except ValueError:
+                console.print('[red]Invalid tokens, kept previous.[/red]')
+            save_bot_config(cfg)
+            console.print(f"[green]✓ Summary engine: model={ai.get('summary_model') or '(Model)'}, "
+                          f"key_env={ai['summary_key_env']}, tokens={ai.get('max_tokens_summary', 400)}.[/green]")
             pause()
 
         else:
@@ -864,6 +900,77 @@ def _mask_secret(value):
     return value[:4] + '*' * (len(value) - 8) + value[-4:]
 
 
+CHANNEL_TYPES = ['telegram', 'line', 'whatsapp']
+
+
+def _menu_delivery_channels():
+    """Manage push destinations (bot_config delivery.channels). Telegram sends directly;
+    LINE/WhatsApp are stored to be routed via OpenClaw (no gateway yet → not sent)."""
+    while True:
+        cfg      = load_json(_config_path('bot_config.json'))
+        delivery = cfg.setdefault('delivery', {})
+        channels = delivery.setdefault('channels', [])
+        header('Delivery Channels — where the report is pushed')
+        console.print('[dim]Telegram sends directly (each channel can name its own token env '
+                      'var + chat id → multiple bots / group chats). LINE & WhatsApp route via '
+                      'OpenClaw — stored but not sent until an OpenClaw gateway exists.[/dim]\n')
+        if not channels:
+            console.print('[dim](none configured → falls back to single env destination '
+                          'TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)[/dim]\n')
+        t = Table(box=box.ROUNDED)
+        t.add_column('#', style='dim', width=3, justify='right')
+        t.add_column('Name', width=16)
+        t.add_column('Type', style='cyan', width=10)
+        t.add_column('Target', width=22)
+        t.add_column('On', justify='center')
+        for i, ch in enumerate(channels, 1):
+            tgt = ch.get('chat_id') or ch.get('target') or '(env default)'
+            on  = '[green]✓[/green]' if ch.get('enabled', True) else '[red]✗[/red]'
+            t.add_row(str(i), ch.get('name', '-'), ch.get('type', 'telegram'), str(tgt), on)
+        console.print(t)
+        console.print('\n[cyan][a][/cyan] Add  [cyan][t][/cyan] Toggle  '
+                      '[cyan][d][/cyan] Delete  [cyan][b][/cyan] Back')
+        choice = Prompt.ask('Action', choices=['a', 't', 'd', 'b'], default='b')
+
+        if choice == 'a':
+            ctype = Prompt.ask('Type', choices=CHANNEL_TYPES, default='telegram')
+            name  = Prompt.ask('Name (label)').strip() or ctype
+            ch = {'type': ctype, 'name': name, 'enabled': True}
+            if ctype == 'telegram':
+                ch['token_env'] = (Prompt.ask('Bot token env var', default='TELEGRAM_BOT_TOKEN').strip()
+                                   or 'TELEGRAM_BOT_TOKEN')
+                ch['chat_id']   = Prompt.ask('Chat ID (group/DM, e.g. -100…)').strip()
+            else:
+                console.print(f'[yellow]{ctype} routes via OpenClaw — no gateway yet, so this '
+                              'channel is stored but will NOT be sent until OpenClaw supports it.[/yellow]')
+                ch['target'] = Prompt.ask(f'{ctype} target (id / number / route)').strip()
+            channels.append(ch)
+            save_bot_config(cfg)
+            console.print('[green]✓ Channel added.[/green]')
+            pause()
+        elif choice == 't':
+            n = Prompt.ask('Channel # to toggle', default='')
+            try:
+                ch = channels[int(n) - 1]
+                ch['enabled'] = not ch.get('enabled', True)
+                save_bot_config(cfg)
+                console.print(f"[green]✓ {ch.get('name')} → {'ON' if ch['enabled'] else 'OFF'}.[/green]")
+            except (ValueError, IndexError):
+                console.print('[red]Invalid #.[/red]')
+            pause()
+        elif choice == 'd':
+            n = Prompt.ask('Channel # to delete', default='')
+            try:
+                rm = channels.pop(int(n) - 1)
+                save_bot_config(cfg)
+                console.print(f"[green]✓ Removed {rm.get('name')}.[/green]")
+            except (ValueError, IndexError):
+                console.print('[red]Invalid #.[/red]')
+            pause()
+        else:
+            break
+
+
 def menu_api_keys():
     while True:
         env = load_env_file(ENV_PATH)
@@ -881,8 +988,9 @@ def menu_api_keys():
             t.add_row(str(i), k, _mask_secret(env.get(k, '')))
         console.print(t)
 
-        console.print('\n[cyan][e][/cyan] Edit a key  [cyan][b][/cyan] Back')
-        choice = Prompt.ask('Action', choices=['e','b'], default='b')
+        console.print('\n[cyan][e][/cyan] Edit a key  [cyan][c][/cyan] Delivery channels  '
+                      '[cyan][b][/cyan] Back')
+        choice = Prompt.ask('Action', choices=['e','c','b'], default='b')
 
         if choice == 'e':
             idx = Prompt.ask('Key # to edit', default='')
@@ -901,6 +1009,8 @@ def menu_api_keys():
                 console.print('[dim]Restart the container for this to take effect:[/dim]')
                 console.print('[dim]  docker compose restart openclaw-financial-bot[/dim]')
             pause()
+        elif choice == 'c':
+            _menu_delivery_channels()
         else:
             break
 
@@ -916,6 +1026,7 @@ MORNING_SECTION_LABELS = [
     ('cost_line',       '  └ 損益摘要行'),
     ('watchlist',       '觀察清單'),
     ('ai_outlook',      'AI 開盤展望'),
+    ('report_summary',  'AI 報告總結'),
 ]
 
 CLOSING_SECTION_LABELS = [
@@ -927,6 +1038,7 @@ CLOSING_SECTION_LABELS = [
     ('watchlist',       '觀察清單'),
     ('news',            '財經新聞'),
     ('ai_research',     'AI 產業研究/推薦'),
+    ('report_summary',  'AI 報告總結'),
 ]
 
 
