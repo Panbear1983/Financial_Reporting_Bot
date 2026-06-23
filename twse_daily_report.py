@@ -389,6 +389,47 @@ def parse_twse_valid(all_stocks):
     return valid
 
 
+def fetch_period_returns(code):
+    """1M / 3M / 1Y price returns (%) for a watchlist stock, from a single yfinance
+    history call (reuses _ticker_history → .TW then .TWO). Returns
+    {'1月': pct|None, '3月': pct|None, '1年': pct|None}; a window is None when the stock
+    lacks enough history (newly listed / 興櫃). Each window aligns to the nearest trading
+    day on or before the cutoff, so holidays/weekends don't skew it."""
+    try:
+        hist = _ticker_history(code, period='1y')
+        if hist is None or hist.empty:
+            return {}
+        closes = hist['Close'].dropna()
+        if len(closes) < 2:
+            return {}
+        cur       = float(closes.iloc[-1])
+        last_date = closes.index[-1]
+        out = {}
+        for label, days in (('1月', 30), ('3月', 90), ('1年', 365)):
+            prior = closes[closes.index <= last_date - pd.Timedelta(days=days)]
+            if len(prior) == 0 or not cur:
+                out[label] = None
+            else:
+                ref = float(prior.iloc[-1])
+                out[label] = ((cur - ref) / ref * 100) if ref else None
+        return out
+    except Exception as e:
+        print(f"[{_now()}] Period-returns error {code}: {e}")
+        return {}
+
+
+def _returns_line(code):
+    """Render the watchlist 績效 strip (1月/3月/1年). Empty string when no data."""
+    rets = fetch_period_returns(code)
+    if not rets:
+        return ""
+    parts = []
+    for label in ('1月', '3月', '1年'):
+        v = rets.get(label)
+        parts.append(f"{label} {v:+.1f}%" if v is not None else f"{label} N/A")
+    return "\n  績效：" + " · ".join(parts)
+
+
 def _twse_row_from_yfinance(code):
     """Closing-report fallback for codes missing from the bulk TWSE/TPEX feeds.
 
@@ -642,6 +683,7 @@ def generate_morning_report():
                 f"• **{name} ({code})**：目前 {price:,.1f}元"
                 f" [昨收 {prev_cls:,.1f} | {direction}{abs(change):.1f}元 ({pct:+.2f}%)]"
             )
+            line += _returns_line(code)
             if reason:
                 line += f"\n  展望：{reason}"
             watch_sections.append(line)
@@ -865,6 +907,7 @@ def generate_closing_report():
             f" ({direction} {abs(change):.1f}元 / {pct:+.2f}%)"
             f" [成交量: {zhang}張]{_src_tag(row)}"
         )
+        line += _returns_line(code)
         if reason:
             line += f"\n    原因：{reason}"
         watch_sections.append(line)
