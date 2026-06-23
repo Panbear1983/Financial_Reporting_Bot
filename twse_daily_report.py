@@ -389,6 +389,42 @@ def parse_twse_valid(all_stocks):
     return valid
 
 
+def _twse_row_from_yfinance(code):
+    """Closing-report fallback for codes missing from the bulk TWSE/TPEX feeds.
+
+    The closing report's twse_by_code comes from fetch_twse_all (STOCK_DAY_ALL,
+    listed board) + fetch_tpex_all (TPEX 上櫃). Stocks not on either — e.g.
+    emerging-board 興櫃 codes like 3595 山太士 — would otherwise render as
+    "今日無交易數據". This builds a TWSE-row-shaped dict from the same per-code
+    yfinance source the morning report uses (.TW then .TWO), so the existing
+    closing render works unchanged. Returns None if yfinance also has no data.
+    """
+    d = fetch_yfinance_stock(code)
+    if not d:
+        return None
+    price  = d['price']
+    prev   = d['prev_close']
+    change = d.get('change', price - prev)
+    pct    = (change / prev * 100) if prev else 0.0
+    return {
+        'Code': code,
+        'OpeningPrice': f"{d.get('today_open', prev):.2f}",
+        'ClosingPrice': f"{price:.2f}",
+        'TradeVolume': '0',        # yfinance chart feed carries no share volume
+        '_change': change,
+        '_close': price,
+        '_pct': pct,
+        '_vol': 0,
+        '_fallback': 'yfinance',   # source marker (yfinance, not TWSE official)
+    }
+
+
+def _src_tag(row):
+    """Inline marker for closing lines sourced via the yfinance fallback rather than
+    TWSE official data — signals the reader the volume figure is not an official 量."""
+    return "（yfinance 報價）" if row.get('_fallback') else ""
+
+
 # ---------------------------------------------------------------------------
 # OpenRouter — text only, numbers always provided via prompt context
 # ---------------------------------------------------------------------------
@@ -750,7 +786,7 @@ def generate_closing_report():
 
     for code, pos in portfolio.items():
         name = pos.get('name', code)
-        row = twse_by_code.get(code)
+        row = twse_by_code.get(code) or _twse_row_from_yfinance(code)
         if not row:
             holding_sections.append(f"• **{name} ({code})**：今日無交易數據")
             holding_sections.append("")
@@ -778,7 +814,7 @@ def generate_closing_report():
         line = (
             f"• **{name} ({code})**：[開盤] {open_p}元 → [收盤] {close_p}元"
             f" ({direction} {abs(change):.1f}元 / {pct:+.2f}%)"
-            f" [成交量: {zhang}張]"
+            f" [成交量: {zhang}張]{_src_tag(row)}"
         )
         try:
             pf_line = format_portfolio_line(pos['shares'], pos['cost_basis'], row['_close'])
@@ -799,7 +835,7 @@ def generate_closing_report():
     for code, name in tracked.items():
         if code in portfolio:
             continue
-        row = twse_by_code.get(code)
+        row = twse_by_code.get(code) or _twse_row_from_yfinance(code)
         if not row:
             watch_sections.append(f"• **{name} ({code})**：今日無交易數據")
             watch_sections.append("")
@@ -827,7 +863,7 @@ def generate_closing_report():
         line = (
             f"• **{name} ({code})**：[開盤] {open_p}元 → [收盤] {close_p}元"
             f" ({direction} {abs(change):.1f}元 / {pct:+.2f}%)"
-            f" [成交量: {zhang}張]"
+            f" [成交量: {zhang}張]{_src_tag(row)}"
         )
         if reason:
             line += f"\n    原因：{reason}"
