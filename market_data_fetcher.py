@@ -17,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/root/Desktop/AgenticOS/market_data.log'),
+        logging.FileHandler(os.getenv('OPENCLAW_DATA_DIR', '/app/data') + '/market_data.log'),
         logging.StreamHandler()
     ]
 )
@@ -134,7 +134,7 @@ class MarketDataAggregator:
     
     def __init__(self):
         self.data_sources: List[MarketDataSource] = []
-        self.cache_dir = "/root/Desktop/AgenticOS/cache"
+        self.cache_dir = os.path.join(os.getenv('OPENCLAW_DATA_DIR', '/app/data'), 'cache')
         os.makedirs(self.cache_dir, exist_ok=True)
 
     def add_data_source(self, source: MarketDataSource):
@@ -197,51 +197,6 @@ class MarketDataAggregator:
             'errors': errors if errors else None
         }
 
-def generate_market_report(data: Dict[str, Any]) -> str:
-    """Generate a comprehensive market report from aggregated data"""
-    report_lines = []
-    report_lines.append("# Taiwan Stock Market Daily Report")
-    report_lines.append(f"Generated at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-
-    # Process TWSE data
-    if 'TWSE' in data['data']:
-        twse_data = data['data']['TWSE']
-        df = pd.DataFrame(twse_data)
-        
-        # Market overview
-        report_lines.append("## Market Overview")
-        report_lines.append(f"Total Stocks: {len(df)}")
-        if 'Change' in df.columns:
-            gainers = len(df[df['Change'].astype(float) > 0])
-            losers = len(df[df['Change'].astype(float) < 0])
-            report_lines.append(f"Advancing: {gainers}")
-            report_lines.append(f"Declining: {losers}\n")
-
-        # Most active stocks
-        report_lines.append("## Most Active Stocks")
-        if 'TradeVolume' in df.columns:
-            most_active = df.nlargest(5, 'TradeVolume')
-            for _, stock in most_active.iterrows():
-                report_lines.append(
-                    f"- {stock['Name']} ({stock['Code']}): "
-                    f"Volume {stock['TradeVolume']}, "
-                    f"Close {stock['ClosingPrice']}"
-                )
-
-    # Add data from other sources
-    for source, source_data in data['data'].items():
-        if source != 'TWSE':
-            report_lines.append(f"\n## {source} Data")
-            report_lines.append(f"```json\n{json.dumps(source_data, indent=2)}\n```")
-
-    # Add error information if any
-    if data.get('errors'):
-        report_lines.append("\n## Data Source Errors")
-        for source, error in data['errors'].items():
-            report_lines.append(f"- {source}: {error}")
-
-    return "\n".join(report_lines)
-
 def main():
     """Main function to run the market data collection and report generation"""
     try:
@@ -260,16 +215,10 @@ def main():
         market_data = aggregator.fetch_market_data()
 
         # Save raw data
-        with open('/root/Desktop/AgenticOS/market_data.json', 'w', encoding='utf-8') as f:
+        with open(os.getenv('OPENCLAW_DATA_DIR', '/app/data') + '/market_data.json', 'w', encoding='utf-8') as f:
             json.dump(market_data, f, ensure_ascii=False, indent=2)
 
-        # Generate and save report
-        logger.info("Generating market report...")
-        report = generate_market_report(market_data)
-        with open('/root/Desktop/AgenticOS/market_report.md', 'w', encoding='utf-8') as f:
-            f.write(report)
-
-        logger.info("Market data collection and report generation completed successfully")
+        logger.info("Market data collection completed successfully")
 
     except Exception as e:
         logger.error(f"Error in main execution: {e}", exc_info=True)

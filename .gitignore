@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Atomic-save artifacts & backups
+*.bak
+*.tmp
+
+# Sandbox/preview output
+sandbox_preview_*.txt
+twse_daily_report.md
+
+# Secrets & personal data (repo has a public remote)
+.env
+portfolio.json
