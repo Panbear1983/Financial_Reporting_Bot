@@ -846,9 +846,9 @@ def menu_ai_settings():
 # [7] API Keys
 # ---------------------------------------------------------------------------
 
-# Scoped to ONLY the secrets the TWSE daily report actually reads
-# (twse_daily_report.py): Telegram delivery + OpenRouter (AI) + Brave (news).
-# Infra/other-routine keys (Robinhood, OpenClaw, network, alt models) are out of scope.
+# This TUI is proprietary to the TWSE daily report — TWSE ONLY.
+# Scoped to ONLY the secrets that report actually reads (twse_daily_report.py):
+# Telegram delivery + OpenRouter (AI) + Brave (news). Infra/network keys are out of scope.
 _ENV_KEY_ORDER = [
     'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID',
     'OPENROUTER_API_KEY',
