@@ -363,13 +363,14 @@ def menu_portfolio():
 
         console.print('\n[cyan][a][/cyan] Add  [cyan][e][/cyan] Edit  '
                       '[cyan][d][/cyan] Delete  [cyan][i][/cyan] Import CSV  '
-                      '[cyan][b][/cyan] Back')
-        choice = Prompt.ask('Action', choices=['a','e','d','i','b'], default='b')
+                      '[cyan][m][/cyan] Mappings  [cyan][b][/cyan] Back')
+        choice = Prompt.ask('Action', choices=['a','e','d','i','m','b'], default='b')
 
         if   choice == 'a': _portfolio_add(portfolio)
         elif choice == 'e': _portfolio_edit(portfolio)
         elif choice == 'd': _portfolio_delete(portfolio)
         elif choice == 'i': menu_import_csv()
+        elif choice == 'm': _menu_name_mappings()
         else: break
 
 
@@ -564,6 +565,27 @@ def _save_name_cache(mapping: dict):
     save_json(NAME_TO_CODE_FILE, mapping)
 
 
+def _prompt_validated_code(label):
+    """Prompt for a stock code and validate it against the TWSE/TPEX universe.
+
+    Returns an uppercased code, or '' to skip. Mirrors the [a] Add behaviour:
+    on a match it shows the official name; on a miss it warns and asks whether to
+    use it anyway (ETFs legitimately miss the bulk feed) — so a typo can never be
+    cached silently the way the old raw prompt allowed."""
+    while True:
+        code = Prompt.ask(label).strip().upper()
+        if not code:
+            return ''
+        official = validate_code(code)
+        if official:
+            console.print(f'  [green]✓ {code} → {official}[/green]')
+            return code
+        console.print(f'  [yellow]⚠ {code} not found on TWSE/TPEX (fund/ETF?)[/yellow]')
+        if Confirm.ask('  Use it anyway?', default=False):
+            return code
+        # otherwise loop and re-prompt (blank to skip)
+
+
 def _parse_brokerage_csv(path: str) -> list:
     """Parse 證券未實現彙總 CSV → list of {name, shares, cost_basis}."""
     rows = []
@@ -638,10 +660,9 @@ def menu_import_csv():
     if unknown:
         console.print(f'\n[yellow]{len(unknown)} stock(s) need manual code entry:[/yellow]')
         for row in unknown:
-            code = Prompt.ask(
+            code = _prompt_validated_code(
                 f'  Code for [bold]{row["name"]}[/bold] '
-                f'({row["shares"]:,} shares, cost {int(row["cost_basis"]):,}元)'
-            ).strip().upper()
+                f'({row["shares"]:,} shares, cost {int(row["cost_basis"]):,}元)')
             if code:
                 resolved.append({**row, 'code': code})
                 cache[row['name']] = code
@@ -691,6 +712,59 @@ def menu_import_csv():
         console.print(f'[green]✓ Portfolio updated — {len(new_portfolio)} holdings, {new_total:,.0f}元[/green]')
 
     pause()
+
+
+def _menu_name_mappings():
+    """View / fix the cached name→code mappings (name_to_code.json) — the manual
+    overrides used to resolve brokerage names the official feed doesn't match.
+    Each row is re-validated against TWSE/TPEX so a wrong/typo mapping is visible."""
+    while True:
+        cache = _load_name_cache()
+        header('Name → Code Mappings — manual overrides (name_to_code.json)')
+        if not cache:
+            console.print('[dim](no cached mappings yet — they are created when you resolve an '
+                          'unknown name during CSV import)[/dim]\n')
+        names = list(cache.keys())
+        t = Table(box=box.ROUNDED)
+        t.add_column('#', style='dim', width=3, justify='right')
+        t.add_column('Name (brokerage)', width=20)
+        t.add_column('Code', style='cyan', width=8)
+        t.add_column('TWSE/TPEX check')
+        for i, name in enumerate(names, 1):
+            code = cache[name]
+            official = validate_code(code)
+            if not official:
+                chk = '[red]⚠ code not found[/red]'
+            elif official != name:
+                chk = f'[yellow]official: {official}[/yellow]'
+            else:
+                chk = '[green]✓[/green]'
+            t.add_row(str(i), name, code, chk)
+        console.print(t)
+        console.print('\n[cyan][a][/cyan] Add/Edit  [cyan][d][/cyan] Delete  [cyan][b][/cyan] Back')
+        choice = Prompt.ask('Action', choices=['a', 'd', 'b'], default='b')
+
+        if choice == 'a':
+            name = Prompt.ask('Stock name (exactly as it appears in the brokerage CSV)').strip()
+            if name:
+                code = _prompt_validated_code(f'  Code for [bold]{name}[/bold]')
+                if code:
+                    cache[name] = code
+                    _save_name_cache(cache)
+                    console.print(f'[green]✓ Mapped {name} → {code}.[/green]')
+            pause()
+        elif choice == 'd':
+            n = Prompt.ask('Mapping # to delete', default='')
+            try:
+                rm = names[int(n) - 1]
+                del cache[rm]
+                _save_name_cache(cache)
+                console.print(f'[green]✓ Removed mapping for {rm}.[/green]')
+            except (ValueError, IndexError):
+                console.print('[red]Invalid #.[/red]')
+            pause()
+        else:
+            break
 
 
 # ---------------------------------------------------------------------------
