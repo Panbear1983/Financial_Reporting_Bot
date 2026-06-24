@@ -863,7 +863,7 @@ def generate_morning_report():
         lines.append(style_footer)
 
     report = "\n".join(lines)
-    _save_and_print(report, output_dir, 'twse_daily_report.md')
+    _save_and_print(report, output_dir, 'twse_daily_report.md', mode='morning')
     return report
 
 
@@ -1123,7 +1123,7 @@ def generate_closing_report():
         lines.append(style_footer)
 
     report = "\n".join(lines)
-    _save_and_print(report, output_dir, 'twse_daily_report.md')
+    _save_and_print(report, output_dir, 'twse_daily_report.md', mode='closing')
     return report
 
 
@@ -1131,12 +1131,41 @@ def generate_closing_report():
 # Shared save + print
 # ---------------------------------------------------------------------------
 
-def _save_and_print(report, output_dir, filename):
+def _prune_report_archive(arch_dir, keep=180):
+    """Keep only the newest `keep` archived reports — caps disk growth.
+    Filenames lead with the date (twse_YYYY-MM-DD_HHMM_*.md), so a lexical sort is
+    chronological; the oldest beyond `keep` are removed."""
+    try:
+        files = sorted(f for f in os.listdir(arch_dir)
+                       if f.startswith('twse_') and f.endswith('.md'))
+        for old in files[:-keep] if keep > 0 else files:
+            try:
+                os.remove(os.path.join(arch_dir, old))
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _save_and_print(report, output_dir, filename, mode=None):
     path = os.path.join(output_dir, filename)
     with open(path, 'w', encoding='utf-8') as f:
         f.write(report)
     print(f"[{_now()}] Report saved to {path}")
+    # Dated local backup of every LIVE report (sandbox runs emit their own preview files).
     if os.getenv('SANDBOX_MODE', '').lower() != 'true':
+        try:
+            arch_dir = os.path.join(output_dir, 'reports')
+            os.makedirs(arch_dir, exist_ok=True)
+            stamp     = datetime.datetime.now().strftime('%Y-%m-%d_%H%M')
+            label     = f"_{mode}" if mode else ""
+            arch_path = os.path.join(arch_dir, f"twse_{stamp}{label}.md")
+            with open(arch_path, 'w', encoding='utf-8') as f:
+                f.write(report)
+            print(f"[{_now()}] Archived → {arch_path}")
+            _prune_report_archive(arch_dir, keep=180)
+        except Exception as e:
+            print(f"[{_now()}] Archive error: {e}")
         print("\n" + "=" * 60)
         print(report)
         print("=" * 60 + "\n")
