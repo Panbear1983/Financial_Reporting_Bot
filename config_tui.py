@@ -32,6 +32,7 @@ try:
     from rich import box
     from rich.prompt import Prompt, Confirm
     from rich.rule import Rule
+    from rich.cells import cell_len
 except ImportError:
     print("Missing dependency: pip install rich")
     sys.exit(1)
@@ -267,16 +268,42 @@ def _twse_name_to_code() -> dict:
 # UI helpers
 # ---------------------------------------------------------------------------
 
-def header(subtitle=''):
+def _measure(renderable):
+    """Rendered max width of a Rich renderable at the current console width."""
+    return console.measure(renderable).maximum
+
+
+# Uniform title-box width shared by every page, so the box looks identical as you
+# navigate. Anchored at runtime to the widest screen (the main menu table) in
+# main_menu(); None until then, in which case header() falls back to hug-title.
+_UNIFORM_WIDTH = None
+
+
+def header(subtitle='', width=None):
     console.clear()
-    body = f"[bold cyan]Financial Report Config[/bold cyan]"
+    title = 'Financial Report Config'
+    # Shorten the data path to its last two segments so it still fits on the
+    # bottom border even at the hug-title floor width.
+    short_path = '/'.join(str(DATA_DIR).rstrip('/').split('/')[-2:])
+    data_line  = f'data: .../{short_path}'
+    body = f"[bold cyan]{title}[/bold cyan]"
     if subtitle:
         body += f"\n[dim]{subtitle}[/dim]"
+    # Floor = hug-title width. cell_len handles double-width CJK subtitles, and the
+    # +6 leaves room for the bottom-border subtitle's surrounding spaces and the
+    # minimum ═ run on each side, so the data path is never clipped.
+    floor = max(cell_len(title), cell_len(subtitle), cell_len(data_line)) + 6
+    # Every page uses the same uniform width by default; an explicit width still
+    # wins. The floor and the terminal width bracket it so the path never clips
+    # and the box never overruns a narrow terminal.
+    target = width if width is not None else (_UNIFORM_WIDTH or floor)
+    box_w  = min(max(target, floor), console.width)
     console.print(Panel(
         body,
-        subtitle=f"[dim]data: {DATA_DIR}[/dim]",
+        subtitle=f"[dim]{data_line}[/dim]",
         box=box.DOUBLE_EDGE,
         border_style='cyan',
+        width=box_w,
     ))
 
 
@@ -294,7 +321,6 @@ def main_menu():
         tracked   = load_json(_config_path('tracked_stocks.json'))
         total_cost = sum(v.get('cost_basis', 0) for v in portfolio.values())
 
-        header('TWSE Daily Report — orchestration')
         t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
         t.add_column(style='bold cyan', width=4)
         t.add_column(style='white', width=26)
@@ -314,6 +340,11 @@ def main_menu():
         t.add_row('[7]', 'Delivery & Keys',
                   f'Telegram · OpenRouter · Brave ({ENV_PATH.name})')
         t.add_row('[q]', 'Quit', '')
+        # Anchor the app-wide uniform title-box width to this (widest) home table,
+        # so every page that follows draws an identically sized box.
+        global _UNIFORM_WIDTH
+        _UNIFORM_WIDTH = _measure(t)
+        header('TWSE Daily Report — orchestration')
         console.print(t)
 
         choice = Prompt.ask('\nSelect', choices=['1','2','3','4','5','6','7','q'], default='q')
@@ -334,7 +365,7 @@ def main_menu():
 # [1] Portfolio
 # ---------------------------------------------------------------------------
 
-def _portfolio_table(portfolio):
+def _build_portfolio_table(portfolio):
     t = Table(title='Portfolio Holdings', box=box.ROUNDED, show_lines=True)
     t.add_column('#',             style='dim',         width=4,  justify='right')
     t.add_column('Code',          style='bold cyan',   width=8)
@@ -349,7 +380,11 @@ def _portfolio_table(portfolio):
         avg  = f'{cost/sh:,.2f}' if sh else '—'
         t.add_row(str(i), code, pos.get('name',''),
                   f'{sh:,}', f'{int(cost):,}', avg)
+    return t
 
+
+def _portfolio_table(portfolio, table=None):
+    t = table if table is not None else _build_portfolio_table(portfolio)
     total = sum(v.get('cost_basis', 0) for v in portfolio.values())
     console.print(t)
     console.print(f'[dim]Total invested: [bold]{total:,.0f}元[/bold] across {len(portfolio)} positions[/dim]')
@@ -452,6 +487,13 @@ def _portfolio_delete(portfolio):
 # [2] Watchlist
 # ---------------------------------------------------------------------------
 
+def _wl_entry(val):
+    """Normalise a watchlist value (legacy str or dict) to {name, note}."""
+    if isinstance(val, dict):
+        return {'name': val.get('name', ''), 'note': val.get('note', '')}
+    return {'name': val or '', 'note': ''}
+
+
 def menu_watchlist():
     while True:
         tracked   = load_json(_config_path('tracked_stocks.json'))
@@ -463,15 +505,19 @@ def menu_watchlist():
             t.add_column('Code', style='bold cyan')
             t.add_column('Name')
             t.add_column('Note', style='dim')
-            for code, name in tracked.items():
-                note = '⚠ also in portfolio' if code in portfolio else 'watch only'
-                t.add_row(code, name, note)
+            for code, val in tracked.items():
+                entry = _wl_entry(val)
+                parts = []
+                if entry['note']:
+                    parts.append(entry['note'])
+                parts.append('⚠ also in portfolio' if code in portfolio else 'watch only')
+                t.add_row(code, entry['name'], ' · '.join(parts))
             console.print(t)
         else:
             console.print('[dim]Empty — only portfolio holdings appear in the report.[/dim]')
 
-        console.print('\n[cyan][a][/cyan] Add  [cyan][d][/cyan] Delete  [cyan][b][/cyan] Back')
-        choice = Prompt.ask('Action', choices=['a','d','b'], default='b')
+        console.print('\n[cyan][a][/cyan] Add  [cyan][e][/cyan] Edit  [cyan][d][/cyan] Delete  [cyan][b][/cyan] Back')
+        choice = Prompt.ask('Action', choices=['a','e','d','b'], default='b')
 
         if choice == 'a':
             code = Prompt.ask('Stock code').strip().upper()
@@ -482,9 +528,23 @@ def menu_watchlist():
             else:
                 api_name = validate_code(code)
                 name = Prompt.ask('Name', default=api_name or '')
-                tracked[code] = name
+                note = Prompt.ask('Note (optional)', default='')
+                tracked[code] = {'name': name, 'note': note}
                 save_json(_config_path('tracked_stocks.json'), tracked)
                 console.print(f'[green]✓ {code} added to watchlist.[/green]')
+            pause()
+
+        elif choice == 'e':
+            code = Prompt.ask('Code to edit').strip().upper()
+            if code not in tracked:
+                console.print(f'[red]{code} not in watchlist.[/red]')
+            else:
+                entry = _wl_entry(tracked[code])
+                name = Prompt.ask('Name', default=entry['name'])
+                note = Prompt.ask('Note', default=entry['note'])
+                tracked[code] = {'name': name, 'note': note}
+                save_json(_config_path('tracked_stocks.json'), tracked)
+                console.print(f'[green]✓ {code} updated.[/green]')
             pause()
 
         elif choice == 'd':

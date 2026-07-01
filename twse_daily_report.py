@@ -40,7 +40,29 @@ def _config_path(filename):
 def load_tracked_stocks():
     path = _config_path('tracked_stocks.json')
     with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)          # {"2330": "台積電", ...}
+        raw = json.load(f)
+    # Values may be a plain name (legacy) or {"name": ..., "note": ...}.
+    # The report only needs the display name, so normalise to {code: name}.
+    return {
+        code: (val.get('name', code) if isinstance(val, dict) else val)
+        for code, val in raw.items()
+    }
+
+
+def load_tracked_notes():
+    """Return {code: note} for watchlist entries that carry a user note.
+
+    Legacy string entries have no note and are omitted. Used by the closing
+    report to surface the note under each watchlist line.
+    """
+    path = _config_path('tracked_stocks.json')
+    with open(path, 'r', encoding='utf-8') as f:
+        raw = json.load(f)
+    return {
+        code: val['note']
+        for code, val in raw.items()
+        if isinstance(val, dict) and val.get('note')
+    }
 
 
 def load_portfolio():
@@ -676,7 +698,8 @@ def ai_closing_commentary(taiex_pct, global_lines, top_vol, top_losers,
 # ---------------------------------------------------------------------------
 
 def generate_morning_report():
-    tracked   = load_tracked_stocks()   # {"2330": "台積電", ...}
+    tracked       = load_tracked_stocks()   # {"2330": "台積電", ...}
+    tracked_notes = load_tracked_notes()
     portfolio = load_portfolio()        # {"2330": {"shares": N, "avg_cost": X}, ...}
     date_str  = datetime.datetime.now().strftime('%Y-%m-%d')
     time_str  = datetime.datetime.now().strftime('%H:%M')
@@ -776,6 +799,8 @@ def generate_morning_report():
             line += _returns_line(code)
             if reason:
                 line += f"\n  展望：{reason}"
+            if tracked_notes.get(code):
+                line += f"\n  📝 備註：{tracked_notes[code]}"
             watch_sections.append(line)
             watch_sections.append("")
         else:
@@ -872,7 +897,8 @@ def generate_morning_report():
 # ---------------------------------------------------------------------------
 
 def generate_closing_report():
-    tracked    = load_tracked_stocks()
+    tracked       = load_tracked_stocks()
+    tracked_notes = load_tracked_notes()
     portfolio  = load_portfolio()
     date_str   = datetime.datetime.now().strftime('%Y-%m-%d')
     time_str   = datetime.datetime.now().strftime('%H:%M')
@@ -1007,6 +1033,8 @@ def generate_closing_report():
         line += _returns_line(code)
         if reason:
             line += f"\n    原因：{reason}"
+        if tracked_notes.get(code):
+            line += f"\n    📝 備註：{tracked_notes[code]}"
         watch_sections.append(line)
         watch_sections.append("")
 

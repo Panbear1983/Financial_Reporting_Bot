@@ -1,87 +1,171 @@
-# Taiwan Stock Market & Global Index Data Scraper Package
+# Financial Reporting Bot
 
-A robust, multi-source financial data scraping and reporting tool designed for the Taiwan Stock Exchange (TWSE) and global market indices. This package is part of the **AgenticOS** ecosystem, providing reliable market data for AI agents and financial analysis.
+Automated Taiwan-market reporting for OpenClaw: a scheduled TWSE/TPEX intelligence pipeline that turns portfolio data, watchlist notes, technical signals, global indices, and AI-written commentary into Telegram-ready morning and closing reports.
 
-## 🚀 Features
+## What It Does
 
-- **Multi-Source Data Aggregation**: Fetches data from TWSE OpenAPI, Yahoo Finance (`yfinance`), and Alpha Vantage with built-in failover support.
-- **Global Index Tracking**: Monitors key global markets (Dow Jones, Nasdaq, S&P 500, SOX, Nikkei 225).
-- **Automatic Reporting**: Generates comprehensive daily market reports in Markdown format.
-- **SSL/TLS Resiliency**: Custom SSL context handling to bypass certificate verification issues with financial APIs.
-- **Parallel Processing**: Uses `ThreadPoolExecutor` for high-performance concurrent data fetching.
-- **Portfolio Tracking**: Customizable `tracked_stocks.json` to monitor specific symbols.
+- Generates two report modes:
+  - `morning`: opening-session snapshot using live `yfinance` prices.
+  - `closing`: post-market report using official TWSE/TPEX data when available.
+- Tracks portfolio holdings with shares, cost basis, current value, and estimated P/L.
+- Tracks non-holding watchlist symbols, including optional user notes that now flow directly into the generated report artifact.
+- Adds technical context such as RSI, volume ratio, return strips, and divergence signals.
+- Uses OpenRouter only for explanatory text. Market figures stay scraper-derived.
+- Sends chunked Markdown reports to Telegram, with sandbox previews for dry runs.
+- Archives every live report as a dated Markdown artifact under `data/reports/`.
+- Provides a Rich terminal UI for portfolio, watchlist, schedule, layout, AI, sandbox, and delivery configuration.
+- Includes a Telegram control bot for mobile-friendly status checks, watchlist commands, portfolio review, and on-demand report triggers.
 
-## 📁 Package Structure
+## Recent Artifact Changes
 
-- `market_data_fetcher.py`: Core engine for aggregating data with caching and failover logic.
-- `twse_daily_report.py`: Specialized script for generating the Markdown report and latest news.
-- `custom_stock_lookup.py`: Utility tool for looking up specific stock details.
-- `tracked_stocks.json`: Configuration for your target portfolio.
-- `requirements.txt`: Project dependencies.
+The latest local changes affect both generated output and operational reliability:
 
-## 📊 Sample Report Output
+- Watchlist entries can now be stored as either the legacy string value or a structured object:
+  ```json
+  {
+    "2330": "台積電",
+    "2412": {
+      "name": "中華電",
+      "note": "Dividend stability watch"
+    }
+  }
+  ```
+- Structured watchlist notes render into both morning and closing report artifacts under the matching watchlist line.
+- `config_tui.py` now supports adding and editing watchlist notes from the terminal UI.
+- The TUI header has a uniform width across pages and shortens the data path so navigation feels stable in narrow terminals.
+- `scheduler.py` now pins scheduling to UTC and performs a startup catch-up run if a weekday morning or closing slot already passed without a saved report.
 
-The bot generates a structured report (`twse_daily_report.md`) that looks like this:
+## Repository Layout
 
-```markdown
-# TWSE & Global Daily Market Report
-**Date:** 2026-03-15 22:34:12
+- `twse_daily_report.py`: report generator, archive writer, Telegram sender, sandbox renderer, OpenRouter commentary hooks.
+- `scheduler.py`: weekday morning/closing scheduler with UTC timing and missed-slot catch-up.
+- `config_tui.py`: Rich-based admin console for configuration and report orchestration.
+- `telegram_control_bot.py`: Telegram command and natural-language control interface.
+- `market_data_fetcher.py`: TWSE/global market data aggregation and failover logic.
+- `custom_stock_lookup.py`: symbol lookup and `yfinance` fallback helpers.
+- `sandbox_run.py`: preview runner that avoids live Telegram delivery.
+- `tracked_stocks.json`: watchlist configuration.
+- `requirements.txt`: Python dependencies.
 
-## Global Indices (美股與日股表現)
-- **Dow Jones (道瓊工業)**: 46,558.47 (-119.38 / -0.26%)
-- **Nasdaq (那斯達克)**: 22,105.36 (-206.62 / -0.93%)
-- **S&P 500 (標普500)**: 6,632.19 (-40.43 / -0.61%)
-- **SOX (費城半導體)**: 7,646.64 (+3.46 / +0.05%)
-- **Nikkei 225 (日經225)**: 53,819.61 (-633.35 / -1.16%)
+Runtime data is resolved from `OPENCLAW_DATA_DIR` when set, otherwise from a local `data/` directory. The bot also reads `.env` values from `OPENCLAW_ENV_FILE`, the data directory parent, or the repository root.
 
-## Market Trends & Rising Stars (市場趨勢與潛力股)
-- 2026具爆發力「AI潛力股名單」曝光...
-- 法人點火提前衝！內資狂敲「14檔新年潛力股」...
+## Configuration Artifacts
 
-## TWSE Overview
-### 🎯 Tracked Portfolio (重點追蹤個股)
-- **2330 台積電**: Close: 1865.00, Change: -20.0
-- **2317 鴻海**: Close: 214.50, Change: 0.0
-- **2454 聯發科**: Close: 1720.00, Change: -65.0
-- **6443 元晶**: Close: 50.60, Change: -0.4
+`tracked_stocks.json`
 
-### Most Active Stocks (by Volume)
-- **3481 群創**: Close: 29.70, Volume: 1,369,365,716
-- **2409 友達**: Close: 16.55, Volume: 324,520,122
+Supports both legacy and structured watchlist formats:
+
+```json
+{
+  "2330": "台積電",
+  "2412": {
+    "name": "中華電",
+    "note": "Yield and telecom-defensive watch"
+  }
+}
 ```
 
-## 🛠️ Installation
+`portfolio.json`
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/Panbear1983/Stock-Scraper-Package.git
-   cd Stock-Scraper-Package
-   ```
+Stores holdings used for position value and P/L calculations:
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```json
+{
+  "2330": {
+    "name": "台積電",
+    "shares": 1000,
+    "cost_basis": 950000
+  }
+}
+```
 
-## 📈 Usage
+`bot_config.json`
 
-### Generating a Daily Report
-Run the following command to fetch global indices, TWSE data, and latest news:
+Controls schedule, AI models, report layout, technical thresholds, delivery channels, and optional per-stock notes. The TUI writes this file atomically and keeps a `.bak` rollback copy.
+
+`.env`
+
+Common keys:
+
 ```bash
-python twse_daily_report.py
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+CONTROL_CHAT_ID=
+OPENROUTER_API_KEY=
+BRAVE_API_KEY=
+OPENCLAW_DATA_DIR=
+OPENCLAW_ENV_FILE=
 ```
 
-### Using the Data Aggregator
-```python
-from market_data_fetcher import MarketDataAggregator, TWSDDataSource
+## Installation
 
-aggregator = MarketDataAggregator()
-aggregator.add_data_source(TWSDDataSource())
-data = aggregator.fetch_market_data("2330.TW")
+```bash
+git clone https://github.com/Panbear1983/Financial_Reporting_Bot.git
+cd Financial_Reporting_Bot
+pip install -r requirements.txt
 ```
 
-## 📜 License
+## Usage
+
+Run the interactive admin console:
+
+```bash
+python config_tui.py
+```
+
+Generate a report without sending it:
+
+```bash
+python twse_daily_report.py --mode=morning --dry-run
+python twse_daily_report.py --mode=closing --dry-run
+```
+
+Run the scheduler:
+
+```bash
+python scheduler.py
+```
+
+Run one scheduled mode immediately:
+
+```bash
+python scheduler.py --now=morning
+python scheduler.py --now=closing
+python scheduler.py --now=all
+```
+
+Preview safely without Telegram delivery:
+
+```bash
+python scheduler.py --sandbox --now=all
+```
+
+Start the Telegram control bot:
+
+```bash
+python telegram_control_bot.py
+```
+
+## Report Artifacts
+
+Live runs write:
+
+- `data/twse_daily_report.md`: latest generated Markdown report.
+- `data/reports/twse_YYYY-MM-DD_HHMMSS_morning.md`: archived morning report.
+- `data/reports/twse_YYYY-MM-DD_HHMMSS_closing.md`: archived closing report.
+
+Sandbox runs write preview files such as:
+
+- `data/sandbox_preview_YYYYMMDD_HHMMSS.txt`
+
+## Design Notes
+
+- Scrapers own the numbers; AI only writes narrative context.
+- Scheduler times are UTC by design: default `01:30` UTC for Taiwan open and `08:00` UTC for Taiwan close.
+- Weekend checks use Taiwan local weekday logic.
+- Telegram delivery is chunked to stay below message size limits.
+- Atomic config writes prevent a scheduled report from reading half-written JSON.
+
+## License
+
 MIT License
-
----
-*Created as part of the AgenticOS ecosystem for advanced market analysis and agentic automation.*
