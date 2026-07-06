@@ -14,3 +14,5 @@ twse_daily_report.md
 # Secrets & personal data (repo has a public remote)
 .env
 portfolio.json
+Import CSV/
+data/

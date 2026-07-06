@@ -34,6 +34,9 @@ The latest local changes affect both generated output and operational reliabilit
 - `config_tui.py` now supports adding and editing watchlist notes from the terminal UI.
 - The TUI header has a uniform width across pages and shortens the data path so navigation feels stable in narrow terminals.
 - `scheduler.py` now pins scheduling to UTC and performs a startup catch-up run if a weekday morning or closing slot already passed without a saved report.
+- `config_tui.py` loads the resolved `.env` at startup, so host-side "Send Now" runs deliver to Telegram with the same credentials Docker injects in-container.
+- Brokerage CSV imports now live in a dedicated `Import CSV/` folder inside the repo: the importer scans it first (plus `~/Downloads` for fresh exports) and moves each file there after a successful import.
+- `schedule` is now declared in `requirements.txt` (it was previously an undeclared dependency of `scheduler.py`).
 
 ## Repository Layout
 
@@ -45,9 +48,10 @@ The latest local changes affect both generated output and operational reliabilit
 - `custom_stock_lookup.py`: symbol lookup and `yfinance` fallback helpers.
 - `sandbox_run.py`: preview runner that avoids live Telegram delivery.
 - `tracked_stocks.json`: watchlist configuration.
+- `Import CSV/`: dedicated home for brokerage export CSVs used by the TUI's portfolio importer (git-ignored — contains personal position data).
 - `requirements.txt`: Python dependencies.
 
-Runtime data is resolved from `OPENCLAW_DATA_DIR` when set, otherwise from a local `data/` directory. The bot also reads `.env` values from `OPENCLAW_ENV_FILE`, the data directory parent, or the repository root.
+Runtime data is resolved from `OPENCLAW_DATA_DIR` when set, otherwise from a local `data/` directory. The bot reads `.env` values from `OPENCLAW_ENV_FILE`, the data directory parent, the OpenClaw agent directory, or the repository root, and the TUI loads the resolved file into the environment at startup (Docker-injected values always win).
 
 ## Configuration Artifacts
 

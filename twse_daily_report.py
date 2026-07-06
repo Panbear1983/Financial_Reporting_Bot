@@ -10,6 +10,7 @@ Data source rules — ZERO figure hallucination:
 
 import urllib.request
 import json
+import csv
 import os
 import re
 import sys
@@ -19,6 +20,8 @@ import requests
 import yfinance as yf
 import numpy as np
 import pandas as pd
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from market_data_fetcher import TWSDDataSource
 from custom_stock_lookup import get_yfinance_data
 
@@ -443,6 +446,61 @@ def fetch_tpex_all():
         return []
 
 
+def fetch_valuation():
+    """{code: {'pe','yield','pb'}} valuation from TWSE BWIBBU_ALL. Best-effort → {}."""
+    def _f(v):
+        try:
+            return float(str(v).replace(',', '').strip())
+        except (TypeError, ValueError):
+            return None
+    out = {}
+    try:
+        r = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL',
+                         headers={'User-Agent': 'Mozilla/5.0'}, timeout=15, verify=False)
+        for s in r.json():
+            code = (s.get('Code') or '').strip()
+            if code:
+                out[code] = {'pe': _f(s.get('PEratio')), 'yield': _f(s.get('DividendYield')),
+                             'pb': _f(s.get('PBratio'))}
+        print(f"[{_now()}] Valuation (P/E, 殖利率, P/B): {len(out)} stocks")
+    except Exception as e:
+        print(f"[{_now()}] Valuation fetch failed: {e}")
+    return out
+
+
+def fetch_margin():
+    """{code: {'bal','chg'}} 融資今日餘額(張) + day-change from TWSE MI_MARGN. Best-effort → {}."""
+    def _i(v):
+        try:
+            return int(str(v).replace(',', '').strip())
+        except (TypeError, ValueError):
+            return None
+    out = {}
+    try:
+        r = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN',
+                         headers={'User-Agent': 'Mozilla/5.0'}, timeout=20, verify=False)
+        for s in r.json():
+            code = (s.get('股票代號') or '').strip()
+            if not code:
+                continue
+            bal, prev = _i(s.get('融資今日餘額')), _i(s.get('融資前日餘額'))
+            chg = (bal - prev) if (bal is not None and prev is not None) else None
+            out[code] = {'bal': bal, 'chg': chg}
+        print(f"[{_now()}] Margin (融資餘額): {len(out)} stocks")
+    except Exception as e:
+        print(f"[{_now()}] Margin fetch failed: {e}")
+    return out
+
+
+def _attach_signals(contexts, valuation, margin):
+    """Attach fundamental signals (valuation + margin) onto each per-stock context in place."""
+    for c in contexts:
+        v = valuation.get(c['code']) or {}
+        m = margin.get(c['code']) or {}
+        c['val'] = {'pe': v.get('pe'), 'yield': v.get('yield'), 'pb': v.get('pb'),
+                    'margin_chg': m.get('chg')}
+
+
 def parse_twse_valid(all_stocks):
     """Attach computed floats to each TWSE stock dict. Returns list of enhanced dicts."""
     valid = []
@@ -496,11 +554,12 @@ def fetch_period_returns(code):
 RETURN_FLAG_PCT = 500.0  # |return| beyond this gets a ⚠ verify-flag
 
 
-def _returns_line(code):
+def _returns_line(code, rets=None):
     """Render the watchlist 績效 strip (1月/3月/1年). Empty string when no data.
     Returns beyond ±RETURN_FLAG_PCT are marked ⚠ — usually a real low-base 興櫃 move,
-    but flagged so a sparse/erroneous early bar isn't taken at face value."""
-    rets = fetch_period_returns(code)
+    but flagged so a sparse/erroneous early bar isn't taken at face value.
+    `rets` may be a precomputed fetch_period_returns() dict to avoid a duplicate call."""
+    rets = rets if rets is not None else fetch_period_returns(code)
     if not rets:
         return ""
     parts = []
@@ -555,10 +614,18 @@ def _src_tag(row):
 # OpenRouter — text only, numbers always provided via prompt context
 # ---------------------------------------------------------------------------
 
-def call_openrouter(prompt, max_tokens=200, model='anthropic/claude-haiku-3-5', api_key=None):
+def call_openrouter(prompt, max_tokens=200, model='anthropic/claude-haiku-3-5', api_key=None,
+                    system=None, temperature=None):
     api_key = api_key or os.getenv('OPENROUTER_API_KEY')
     if not api_key:
         return ''
+    messages = []
+    if system:
+        messages.append({'role': 'system', 'content': system})
+    messages.append({'role': 'user', 'content': prompt})
+    payload = {'model': model, 'messages': messages, 'max_tokens': max_tokens}
+    if temperature is not None:
+        payload['temperature'] = temperature
     try:
         resp = requests.post(
             'https://openrouter.ai/api/v1/chat/completions',
@@ -566,11 +633,7 @@ def call_openrouter(prompt, max_tokens=200, model='anthropic/claude-haiku-3-5', 
                 'Authorization': f'Bearer {api_key}',
                 'Content-Type': 'application/json',
             },
-            json={
-                'model': model,
-                'messages': [{'role': 'user', 'content': prompt}],
-                'max_tokens': max_tokens,
-            },
+            json=payload,
             timeout=20,
         )
         if resp.ok:
@@ -580,28 +643,49 @@ def call_openrouter(prompt, max_tokens=200, model='anthropic/claude-haiku-3-5', 
     return ''
 
 
-def ai_report_summary(report_text, cfg):
-    """One AI pass over the fully-compiled report → a 報告總結 analyst conclusion.
+def ai_report_summary(report_text, cfg, digest='', history=''):
+    """One AI pass over the compiled report → a 報告總結 analyst conclusion.
 
-    Pluggable summarization engine: ai.summary_model (falls back to ai.model) and
-    ai.summary_key_env (which env var holds the OpenRouter key, default
-    OPENROUTER_API_KEY) — so the user can point the summary at a different model/key
-    than the per-stock reasoning. Returns '' on any failure or when the engine is
-    unconfigured, so a bad/empty AI call can never blank the report."""
-    ai_cfg     = cfg.get('ai', {})
-    model      = ai_cfg.get('summary_model') or ai_cfg.get('model', 'anthropic/claude-haiku-3-5')
-    max_tokens = int(ai_cfg.get('max_tokens_summary', 400) or 400)
-    key_env    = ai_cfg.get('summary_key_env', 'OPENROUTER_API_KEY')
-    api_key    = os.getenv(key_env) or os.getenv('OPENROUTER_API_KEY')
-    prompt = (
-        "你是一位專業的台股分析師。以下是今日自動產生的完整台股報告，"
-        "請根據其中的數據（持倉、觀察清單、技術指標、全球市場、財經新聞）"
-        "撰寫一段精簡的「報告總結」：點出今日重點、持倉整體狀況、觀察清單值得注意之處、"
-        "以及需留意的風險。請用繁體中文，3-5 句或條列，避免重複原文的逐項數字。\n\n"
+    `report_text` is expected to be NOTE-SCRUBBED by the caller (no 📝 lines): the
+    static hand-written notes are a fixed thesis and must not contaminate analysis of
+    a fluid market. `digest` is an optional NOTE-FREE structured block (today's
+    objective signals); `history` is an optional NOTE-FREE recent-trend block (from the
+    data pool) so the model can reason over trajectories/streaks, not just a snapshot.
+
+    Pluggable engine: ai.summary_model (falls back to ai.model), ai.summary_key_env
+    (env var holding the OpenRouter key), ai.summary_temperature (default 0.3).
+    Returns '' on any failure so a bad/empty AI call can never blank the report."""
+    ai_cfg      = cfg.get('ai', {})
+    model       = ai_cfg.get('summary_model') or ai_cfg.get('model', 'anthropic/claude-haiku-3-5')
+    max_tokens  = int(ai_cfg.get('max_tokens_summary', 400) or 400)
+    key_env     = ai_cfg.get('summary_key_env', 'OPENROUTER_API_KEY')
+    api_key     = os.getenv(key_env) or os.getenv('OPENROUTER_API_KEY')
+    temperature = ai_cfg.get('summary_temperature', 0.3)
+    system = (
+        "你是一位嚴謹的台股分析師。只根據所提供的『當日客觀數據』、『近期走勢』與報告內容進行分析，"
+        "不得臆測使用者的選股理由或動機（報告不含使用者備註）。對觀察清單，"
+        "請依當日價格動作、技術指標（RSI／量比／乖離）與 1月／3月／1年 報酬給出判斷，"
+        "並可參考近期走勢指出趨勢與連續性（如連續數日漲跌、與昨日比較），但結論仍以當日數據為主。"
+    )
+    parts = []
+    if digest:
+        parts.append(f"=== 當日客觀數據 ===\n{digest}\n=== 數據結束 ===")
+    if history:
+        parts.append(f"=== 近期走勢（供趨勢／連續性判斷） ===\n{history}\n=== 走勢結束 ===")
+    parts.append(
+        "以下為今日完整台股報告（供全球市場與新聞背景參考）：\n"
         f"=== 報告內容 ===\n{report_text}\n=== 報告結束 ==="
     )
+    parts.append(
+        "請撰寫「報告總結」（繁體中文，精簡條列）：\n"
+        "1. 今日重點與持倉整體狀況（可對比近期走勢指出趨勢）；\n"
+        "2. 【觀察清單】逐檔給出 值得關注／觀望／回避 的判斷，並以當日數據佐證（可引用關鍵數字、點出連續性）；\n"
+        "3. 需留意的風險。"
+    )
+    prompt = "\n\n".join(parts)
     try:
-        return call_openrouter(prompt, max_tokens=max_tokens, model=model, api_key=api_key)
+        return call_openrouter(prompt, max_tokens=max_tokens, model=model, api_key=api_key,
+                               system=system, temperature=temperature)
     except Exception as e:
         print(f"[{_now()}] Report-summary error: {e}")
         return ''
@@ -662,6 +746,56 @@ def ai_stock_reason(name, code, open_p, close_p, change, pct, rsi, vol_ratio, zh
     return call_openrouter(prompt, max_tokens=max_tokens, model=model)
 
 
+def ai_stock_reasons_batch(contexts, taiex_pct, cfg):
+    """ONE batched AI call for every stock's one-line 原因 → {code: reason}.
+
+    Replaces ~N separate ai_stock_reason() calls with a single cross-stock-aware
+    request (cheaper, faster, and it can compare names). `contexts` is a list of
+    per-stock dicts (code/name/change/pct/rsi/vol_ratio/zhang and optional 'val'
+    signals). Returns {} on any failure, so callers simply omit 原因 — never blanks."""
+    if not contexts:
+        return {}
+    ai_cfg = cfg.get('ai', {})
+    model  = ai_cfg.get('model', 'anthropic/claude-haiku-3-5')
+    max_tokens = min(45 * len(contexts) + 120, 2000)
+    rows = []
+    for c in contexts:
+        direction = '漲' if c.get('change', 0) >= 0 else '跌'
+        val = c.get('val') or {}
+        extra = []
+        if val.get('pe') is not None:
+            extra.append(f"PE{val['pe']}")
+        if val.get('yield') is not None:
+            extra.append(f"殖利率{val['yield']}%")
+        if val.get('margin_chg') is not None:
+            extra.append(f"融資變化{val['margin_chg']:+}張")
+        rows.append(
+            f"{c['code']} {c['name']}：{direction}{abs(c.get('change', 0)):.1f}元"
+            f"({c.get('pct', 0):+.2f}%) RSI{c.get('rsi')} 量比{c.get('vol_ratio')} "
+            f"量{c.get('zhang', 'N/A')}張" + ("　" + " ".join(extra) if extra else "")
+        )
+    prompt = (
+        f"今日加權指數 {taiex_pct:+.2f}%。以下為多檔台股今日數據，請為每一檔用繁體中文寫一句"
+        f"（30字內）解釋今日漲跌的具體原因，聚焦個股因素，避免『市場情緒』等通用詞。\n"
+        f"嚴格逐行輸出，每行格式「代號: 原因」，僅此格式，不要標題或多餘文字。\n\n"
+        + "\n".join(rows)
+    )
+    text = call_openrouter(prompt, max_tokens=max_tokens, model=model,
+                           temperature=ai_cfg.get('reason_temperature'))
+    out = {}
+    for ln in (text or '').splitlines():
+        ln = ln.strip().lstrip('-*•　 ').strip()
+        sep = '：' if '：' in ln else (':' if ':' in ln else '')
+        if not sep:
+            continue
+        left, _, reason = ln.partition(sep)
+        m = re.search(r'(\d{4,6}[A-Z]?)', left)      # pull the ticker from '代號' or '名稱(代號)'
+        reason = reason.strip()
+        if m and reason:
+            out[m.group(1)] = reason
+    return out
+
+
 def ai_morning_outlook(taiex_pct, global_lines, stock_lines,
                         max_tokens=200, model='anthropic/claude-haiku-3-5'):
     """Short morning market outlook. No figures generated by AI."""
@@ -720,92 +854,108 @@ def generate_morning_report():
 
     print(f"[{_now()}] [MORNING] Fetching holdings (yfinance live)...")
     holding_sections = []
+    holdings_data    = []
     stock_summary    = []
     pf_daily_total   = 0.0
     pf_gain_total    = 0.0
     pf_cost_total    = 0.0
 
+    _valuation = fetch_valuation()
+    _margin    = fetch_margin()
+
+    # Pass 1 — gather holdings (data only; 展望 comes from one batched call below)
+    hold_ctx = []
     for code, pos in portfolio.items():
         name = pos.get('name', code)
         d = fetch_yfinance_stock(code)
         rsi, vol_ratio = fetch_stock_technicals(code, opening_mode=True, period_days=period_days)
-        rsi_s   = f"{rsi}"       if rsi       is not None else 'N/A'
-        ratio_s = f"{vol_ratio}" if vol_ratio is not None else 'N/A'
-
         if d:
-            price    = d['price']
-            prev_cls = d['prev_close']
-            change   = d['change']
-            pct      = change / prev_cls * 100 if prev_cls else 0.0
-            direction = '漲' if change >= 0 else '跌'
-            reason = ai_stock_reason(
-                name, code, d['today_open'], price, change, pct, rsi_s, ratio_s, 'N/A', taiex_pct,
-                divergence_threshold=technicals_cfg.get('divergence_threshold', 1.5),
-                rsi_overbought=technicals_cfg.get('rsi_overbought', 80),
-                rsi_oversold=technicals_cfg.get('rsi_oversold', 30),
-                max_tokens=ai_cfg.get('max_tokens_reason', 100),
-                model=ai_cfg.get('model', 'anthropic/claude-haiku-3-5'),
-            )
-            line = (
-                f"• **{name} ({code})**：目前 {price:,.1f}元"
-                f" [昨收 {prev_cls:,.1f} | {direction}{abs(change):.1f}元 ({pct:+.2f}%)]"
-            )
-            try:
-                pf_line = format_portfolio_line(pos['shares'], pos['cost_basis'], price)
-                line += '\n' + pf_line
-                pf_daily_total += pos['shares'] * change
-                pf_gain_total  += pos['shares'] * price - pos['cost_basis']
-                pf_cost_total  += pos['cost_basis']
-            except (ValueError, TypeError, KeyError):
-                pass
-            if reason:
-                line += f"\n  展望：{reason}"
-            line += _stock_note(cfg, code)
-            holding_sections.append(line)
-            holding_sections.append("")
-            stock_summary.append(f"{name}({code}) {direction}{abs(pct):.1f}%")
+            price, prev_cls, change = d['price'], d['prev_close'], d['change']
+            pct = change / prev_cls * 100 if prev_cls else 0.0
+            hold_ctx.append({
+                'code': code, 'name': name, 'pos': pos,
+                'price': price, 'prev_cls': prev_cls, 'change': change, 'pct': pct,
+                'rsi': rsi, 'vol_ratio': vol_ratio, 'zhang': 'N/A',
+            })
         else:
             holding_sections.append(f"• **{name} ({code})**：資料暫時無法取得")
             holding_sections.append("")
 
     print(f"[{_now()}] [MORNING] Fetching watchlist (yfinance live)...")
     watch_sections = []
+    watch_data     = []
+    watch_ctx = []
     for code, name in tracked.items():
         if code in portfolio:
             continue
         d = fetch_yfinance_stock(code)
         rsi, vol_ratio = fetch_stock_technicals(code, opening_mode=True, period_days=period_days)
-        rsi_s   = f"{rsi}"       if rsi       is not None else 'N/A'
-        ratio_s = f"{vol_ratio}" if vol_ratio is not None else 'N/A'
-
         if d:
-            price    = d['price']
-            prev_cls = d['prev_close']
-            change   = d['change']
-            pct      = change / prev_cls * 100 if prev_cls else 0.0
-            direction = '漲' if change >= 0 else '跌'
-            reason = ai_stock_reason(
-                name, code, d['today_open'], price, change, pct, rsi_s, ratio_s, 'N/A', taiex_pct,
-                divergence_threshold=technicals_cfg.get('divergence_threshold', 1.5),
-                rsi_overbought=technicals_cfg.get('rsi_overbought', 80),
-                rsi_oversold=technicals_cfg.get('rsi_oversold', 30),
-                max_tokens=ai_cfg.get('max_tokens_reason', 100),
-                model=ai_cfg.get('model', 'anthropic/claude-haiku-3-5'),
-            )
-            line = (
-                f"• **{name} ({code})**：目前 {price:,.1f}元"
-                f" [昨收 {prev_cls:,.1f} | {direction}{abs(change):.1f}元 ({pct:+.2f}%)]"
-            )
-            line += _returns_line(code)
-            if reason:
-                line += f"\n  展望：{reason}"
-            if tracked_notes.get(code):
-                line += f"\n  📝 備註：{tracked_notes[code]}"
-            watch_sections.append(line)
-            watch_sections.append("")
+            price, prev_cls, change = d['price'], d['prev_close'], d['change']
+            pct = change / prev_cls * 100 if prev_cls else 0.0
+            watch_ctx.append({
+                'code': code, 'name': name,
+                'price': price, 'prev_cls': prev_cls, 'change': change, 'pct': pct,
+                'rsi': rsi, 'vol_ratio': vol_ratio, 'zhang': 'N/A',
+                'rets': fetch_period_returns(code), 'note': tracked_notes.get(code, ''),
+            })
         else:
             watch_sections.append(f"• **{name} ({code})**：資料暫時無法取得")
             watch_sections.append("")
+
+    # One batched AI call for every 展望 (holdings + watchlist) — cross-stock aware
+    _attach_signals(hold_ctx + watch_ctx, _valuation, _margin)
+    print(f"[{_now()}] [MORNING] AI 展望 (batched, {len(hold_ctx) + len(watch_ctx)} stocks)...")
+    _reasons = ai_stock_reasons_batch(hold_ctx + watch_ctx, taiex_pct, cfg)
+
+    # Pass 2 — render holdings
+    for c in hold_ctx:
+        code, name = c['code'], c['name']
+        reason = _reasons.get(code, '')
+        price, prev_cls, change, pct = c['price'], c['prev_cls'], c['change'], c['pct']
+        direction = '漲' if change >= 0 else '跌'
+        line = (
+            f"• **{name} ({code})**：目前 {price:,.1f}元"
+            f" [昨收 {prev_cls:,.1f} | {direction}{abs(change):.1f}元 ({pct:+.2f}%)]"
+        )
+        try:
+            pf_line = format_portfolio_line(c['pos']['shares'], c['pos']['cost_basis'], price)
+            line += '\n' + pf_line
+            pf_daily_total += c['pos']['shares'] * change
+            pf_gain_total  += c['pos']['shares'] * price - c['pos']['cost_basis']
+            pf_cost_total  += c['pos']['cost_basis']
+        except (ValueError, TypeError, KeyError):
+            pass
+        if reason:
+            line += f"\n  展望：{reason}"
+        line += _stock_note(cfg, code)
+        holding_sections.append(line)
+        holding_sections.append("")
+        holdings_data.append(_stock_row(
+            code, name, price, change, pct, c['rsi'], c['vol_ratio'], reason,
+            (cfg.get('notes') or {}).get(str(code), ''), valuation=c.get('val')))
+        stock_summary.append(f"{name}({code}) {direction}{abs(pct):.1f}%")
+
+    # Pass 2 — render watchlist
+    for c in watch_ctx:
+        code, name = c['code'], c['name']
+        reason = _reasons.get(code, '')
+        price, prev_cls, change, pct = c['price'], c['prev_cls'], c['change'], c['pct']
+        direction = '漲' if change >= 0 else '跌'
+        line = (
+            f"• **{name} ({code})**：目前 {price:,.1f}元"
+            f" [昨收 {prev_cls:,.1f} | {direction}{abs(change):.1f}元 ({pct:+.2f}%)]"
+        )
+        line += _returns_line(code, c['rets'])
+        if reason:
+            line += f"\n  展望：{reason}"
+        if c['note']:
+            line += f"\n  📝 備註：{c['note']}"
+        watch_sections.append(line)
+        watch_sections.append("")
+        watch_data.append(_stock_row(
+            code, name, price, change, pct, c['rsi'], c['vol_ratio'], reason,
+            c['note'], returns=c['rets'], valuation=c.get('val')))
 
     print(f"[{_now()}] [MORNING] Generating AI outlook...")
     outlook = ai_morning_outlook(
@@ -875,8 +1025,24 @@ def generate_morning_report():
         if sections.get(key, True) and key in blocks:
             lines.extend(blocks[key])
 
+    _summary = ''
     if sections.get('report_summary', True):
-        _summary = ai_report_summary("\n".join(lines), cfg)
+        # Scrub manual 📝 notes (watchlist 備註 + holdings note) — a static thesis must
+        # not contaminate analysis of a fluid market. Notes still print in the report.
+        _clean = "\n".join(l for l in "\n".join(lines).split("\n")
+                           if not l.lstrip().startswith("📝"))
+        _digest = _summary_digest(watch_data, holdings_data, {
+            'taiex_pct': taiex_pct, 'pf_cost_total': pf_cost_total,
+            'pf_value_total': pf_cost_total + pf_gain_total, 'pf_gain_total': pf_gain_total,
+            'pf_total_pct': (pf_gain_total / pf_cost_total * 100) if pf_cost_total else 0.0,
+            'pf_day_pnl': pf_daily_total,
+        }, technicals_cfg)
+        _hist = _history_digest(
+            _load_pool_history(output_dir, 'morning', ai_cfg.get('summary_history_days', 5)),
+            {'date': date_str, 'taiex_pct': taiex_pct,
+             'pf_total_pct': (pf_gain_total / pf_cost_total * 100) if pf_cost_total else 0.0},
+            watch_data)
+        _summary = ai_report_summary(_clean, cfg, digest=_digest, history=_hist)
         if _summary:
             lines.append("")
             lines.append("📋 **報告總結（AI 分析師）：**")
@@ -888,7 +1054,12 @@ def generate_morning_report():
         lines.append(style_footer)
 
     report = "\n".join(lines)
-    _save_and_print(report, output_dir, 'twse_daily_report.md', mode='morning')
+    record = _build_pool_record(
+        'morning', date_str, taiex_pct,
+        pf_daily_total, pf_gain_total, pf_cost_total,
+        holdings_data, watch_data,
+        ai_summary=_summary, ai_commentary=(outlook or ''), news=[])
+    _save_and_print(report, output_dir, 'twse_daily_report.md', mode='morning', record=record)
     return report
 
 
@@ -943,12 +1114,19 @@ def generate_closing_report():
             if s['Code'] not in twse_by_code:
                 twse_by_code[s['Code']] = s
 
-    print(f"[{_now()}] [CLOSING] Fetching technicals + AI for holdings...")
+    print(f"[{_now()}] [CLOSING] Fetching fundamentals (valuation, margin)...")
+    _valuation = fetch_valuation()
+    _margin    = fetch_margin()
+
+    print(f"[{_now()}] [CLOSING] Gathering holdings + watchlist...")
     holding_sections = []
+    holdings_data    = []
     pf_daily_total   = 0.0
     pf_gain_total    = 0.0
     pf_cost_total    = 0.0
 
+    # Pass 1 — gather holdings (data only; 原因 comes from one batched call below)
+    hold_ctx = []
     for code, pos in portfolio.items():
         name = pos.get('name', code)
         row = twse_by_code.get(code) or _twse_row_from_yfinance(code)
@@ -956,47 +1134,19 @@ def generate_closing_report():
             holding_sections.append(f"• **{name} ({code})**：今日無交易數據")
             holding_sections.append("")
             continue
-
-        open_p  = row.get('OpeningPrice', 'N/A')
-        close_p = row.get('ClosingPrice', 'N/A')
-        change  = row['_change']
-        pct     = row['_pct']
-        zhang   = format_zhang(row.get('TradeVolume', '0'))
-        direction = '漲' if change >= 0 else '跌'
-
         rsi, vol_ratio = fetch_stock_technicals(code, period_days=period_days)
-        rsi_s   = f"{rsi}"       if rsi       is not None else 'N/A'
-        ratio_s = f"{vol_ratio}" if vol_ratio is not None else 'N/A'
+        hold_ctx.append({
+            'code': code, 'name': name, 'pos': pos, 'row': row,
+            'open_p': row.get('OpeningPrice', 'N/A'), 'close_p': row.get('ClosingPrice', 'N/A'),
+            'change': row['_change'], 'pct': row['_pct'],
+            'zhang': format_zhang(row.get('TradeVolume', '0')),
+            'rsi': rsi, 'vol_ratio': vol_ratio,
+        })
 
-        reason = ai_stock_reason(
-            name, code, open_p, close_p, change, pct, rsi_s, ratio_s, zhang, taiex_pct,
-            divergence_threshold=technicals_cfg.get('divergence_threshold', 1.5),
-            rsi_overbought=technicals_cfg.get('rsi_overbought', 80),
-            rsi_oversold=technicals_cfg.get('rsi_oversold', 30),
-            max_tokens=ai_cfg.get('max_tokens_reason', 100),
-            model=ai_cfg.get('model', 'anthropic/claude-haiku-3-5'),
-        )
-        line = (
-            f"• **{name} ({code})**：[開盤] {open_p}元 → [收盤] {close_p}元"
-            f" ({direction} {abs(change):.1f}元 / {pct:+.2f}%)"
-            f" [成交量: {zhang}張]{_src_tag(row)}"
-        )
-        try:
-            pf_line = format_portfolio_line(pos['shares'], pos['cost_basis'], row['_close'])
-            line += '\n' + pf_line
-            pf_daily_total += pos['shares'] * change
-            pf_gain_total  += pos['shares'] * row['_close'] - pos['cost_basis']
-            pf_cost_total  += pos['cost_basis']
-        except (ValueError, TypeError, KeyError):
-            pass
-        if reason:
-            line += f"\n    原因：{reason}"
-        line += _stock_note(cfg, code)
-        holding_sections.append(line)
-        holding_sections.append("")
-
-    print(f"[{_now()}] [CLOSING] Fetching technicals + AI for watchlist...")
+    # Pass 1 — gather watchlist
     watch_sections = []
+    watch_data     = []
+    watch_ctx = []
     for code, name in tracked.items():
         if code in portfolio:
             continue
@@ -1005,38 +1155,66 @@ def generate_closing_report():
             watch_sections.append(f"• **{name} ({code})**：今日無交易數據")
             watch_sections.append("")
             continue
-
-        open_p  = row.get('OpeningPrice', 'N/A')
-        close_p = row.get('ClosingPrice', 'N/A')
-        change  = row['_change']
-        pct     = row['_pct']
-        zhang   = format_zhang(row.get('TradeVolume', '0'))
-        direction = '漲' if change >= 0 else '跌'
-
         rsi, vol_ratio = fetch_stock_technicals(code, period_days=period_days)
-        rsi_s   = f"{rsi}"       if rsi       is not None else 'N/A'
-        ratio_s = f"{vol_ratio}" if vol_ratio is not None else 'N/A'
+        watch_ctx.append({
+            'code': code, 'name': name, 'row': row,
+            'open_p': row.get('OpeningPrice', 'N/A'), 'close_p': row.get('ClosingPrice', 'N/A'),
+            'change': row['_change'], 'pct': row['_pct'],
+            'zhang': format_zhang(row.get('TradeVolume', '0')),
+            'rsi': rsi, 'vol_ratio': vol_ratio, 'rets': fetch_period_returns(code),
+            'note': tracked_notes.get(code, ''),
+        })
 
-        reason = ai_stock_reason(
-            name, code, open_p, close_p, change, pct, rsi_s, ratio_s, zhang, taiex_pct,
-            divergence_threshold=technicals_cfg.get('divergence_threshold', 1.5),
-            rsi_overbought=technicals_cfg.get('rsi_overbought', 80),
-            rsi_oversold=technicals_cfg.get('rsi_oversold', 30),
-            max_tokens=ai_cfg.get('max_tokens_reason', 100),
-            model=ai_cfg.get('model', 'anthropic/claude-haiku-3-5'),
-        )
+    # One batched AI call for every 原因 (holdings + watchlist) — cross-stock aware
+    _attach_signals(hold_ctx + watch_ctx, _valuation, _margin)
+    print(f"[{_now()}] [CLOSING] AI 原因 (batched, {len(hold_ctx) + len(watch_ctx)} stocks)...")
+    _reasons = ai_stock_reasons_batch(hold_ctx + watch_ctx, taiex_pct, cfg)
+
+    # Pass 2 — render holdings
+    for c in hold_ctx:
+        code, name, row = c['code'], c['name'], c['row']
+        reason = _reasons.get(code, '')
         line = (
-            f"• **{name} ({code})**：[開盤] {open_p}元 → [收盤] {close_p}元"
-            f" ({direction} {abs(change):.1f}元 / {pct:+.2f}%)"
-            f" [成交量: {zhang}張]{_src_tag(row)}"
+            f"• **{name} ({code})**：[開盤] {c['open_p']}元 → [收盤] {c['close_p']}元"
+            f" ({'漲' if c['change'] >= 0 else '跌'} {abs(c['change']):.1f}元 / {c['pct']:+.2f}%)"
+            f" [成交量: {c['zhang']}張]{_src_tag(row)}"
         )
-        line += _returns_line(code)
+        try:
+            pf_line = format_portfolio_line(c['pos']['shares'], c['pos']['cost_basis'], row['_close'])
+            line += '\n' + pf_line
+            pf_daily_total += c['pos']['shares'] * c['change']
+            pf_gain_total  += c['pos']['shares'] * row['_close'] - c['pos']['cost_basis']
+            pf_cost_total  += c['pos']['cost_basis']
+        except (ValueError, TypeError, KeyError):
+            pass
         if reason:
             line += f"\n    原因：{reason}"
-        if tracked_notes.get(code):
-            line += f"\n    📝 備註：{tracked_notes[code]}"
+        line += _stock_note(cfg, code)
+        holding_sections.append(line)
+        holding_sections.append("")
+        holdings_data.append(_stock_row(
+            code, name, row.get('_close'), c['change'], c['pct'], c['rsi'], c['vol_ratio'], reason,
+            (cfg.get('notes') or {}).get(str(code), ''), valuation=c.get('val')))
+
+    # Pass 2 — render watchlist
+    for c in watch_ctx:
+        code, name, row = c['code'], c['name'], c['row']
+        reason = _reasons.get(code, '')
+        line = (
+            f"• **{name} ({code})**：[開盤] {c['open_p']}元 → [收盤] {c['close_p']}元"
+            f" ({'漲' if c['change'] >= 0 else '跌'} {abs(c['change']):.1f}元 / {c['pct']:+.2f}%)"
+            f" [成交量: {c['zhang']}張]{_src_tag(row)}"
+        )
+        line += _returns_line(code, c['rets'])
+        if reason:
+            line += f"\n    原因：{reason}"
+        if c['note']:
+            line += f"\n    📝 備註：{c['note']}"
         watch_sections.append(line)
         watch_sections.append("")
+        watch_data.append(_stock_row(
+            code, name, row.get('_close'), c['change'], c['pct'], c['rsi'], c['vol_ratio'], reason,
+            c['note'], returns=c['rets'], valuation=c.get('val')))
 
     print(f"[{_now()}] [CLOSING] Fetching Brave news headlines...")
     brave_headlines = fetch_brave_news(
@@ -1138,8 +1316,24 @@ def generate_closing_report():
         if sections.get(key, True) and key in blocks:
             lines.extend(blocks[key])
 
+    _summary = ''
     if sections.get('report_summary', True):
-        _summary = ai_report_summary("\n".join(lines), cfg)
+        # Scrub manual 📝 notes (watchlist 備註 + holdings note) — a static thesis must
+        # not contaminate analysis of a fluid market. Notes still print in the report.
+        _clean = "\n".join(l for l in "\n".join(lines).split("\n")
+                           if not l.lstrip().startswith("📝"))
+        _digest = _summary_digest(watch_data, holdings_data, {
+            'taiex_pct': taiex_pct, 'pf_cost_total': pf_cost_total,
+            'pf_value_total': pf_cost_total + pf_gain_total, 'pf_gain_total': pf_gain_total,
+            'pf_total_pct': (pf_gain_total / pf_cost_total * 100) if pf_cost_total else 0.0,
+            'pf_day_pnl': pf_daily_total,
+        }, technicals_cfg)
+        _hist = _history_digest(
+            _load_pool_history(output_dir, 'closing', ai_cfg.get('summary_history_days', 5)),
+            {'date': date_str, 'taiex_pct': taiex_pct,
+             'pf_total_pct': (pf_gain_total / pf_cost_total * 100) if pf_cost_total else 0.0},
+            watch_data)
+        _summary = ai_report_summary(_clean, cfg, digest=_digest, history=_hist)
         if _summary:
             lines.append("")
             lines.append("📋 **報告總結（AI 分析師）：**")
@@ -1151,13 +1345,232 @@ def generate_closing_report():
         lines.append(style_footer)
 
     report = "\n".join(lines)
-    _save_and_print(report, output_dir, 'twse_daily_report.md', mode='closing')
+    _commentary = "\n\n".join(p for p in (research, recommend) if p)
+    record = _build_pool_record(
+        'closing', date_str, taiex_pct,
+        pf_daily_total, pf_gain_total, pf_cost_total,
+        holdings_data, watch_data,
+        ai_summary=_summary, ai_commentary=_commentary, news=brave_headlines or [])
+    _save_and_print(report, output_dir, 'twse_daily_report.md', mode='closing', record=record)
     return report
 
 
 # ---------------------------------------------------------------------------
 # Shared save + print
 # ---------------------------------------------------------------------------
+
+def _stock_row(code, name, close, change, pct, rsi, vol_ratio, ai_reason, note,
+               returns=None, valuation=None):
+    """One structured per-stock entry for the data pool (holdings / watchlist).
+    `returns` is the 1月/3月/1年 dict; `valuation` holds pe/yield/pb/margin_chg."""
+    return {
+        'code': code, 'name': name,
+        'close': close, 'change': change, 'pct': pct,
+        'rsi': rsi, 'vol_ratio': vol_ratio,
+        'returns': returns or {},
+        'valuation': valuation or {},
+        'ai_reason': (ai_reason or '').strip(),
+        'note': (note or '').strip(),
+    }
+
+
+def _rsi_state(rsi, tech_cfg):
+    if rsi is None:
+        return ''
+    if rsi >= tech_cfg.get('rsi_overbought', 80):
+        return '超買'
+    if rsi <= tech_cfg.get('rsi_oversold', 30):
+        return '超賣'
+    return ''
+
+
+def _summary_digest(watch_data, holdings_data, scalars, tech_cfg):
+    """Compact, NOTE-FREE structured digest fed to the analyst summary so it reads
+    the watchlist on objective signals (RSI/量比/乖離/報酬) instead of scraped prose.
+    Deliberately omits the static 備註 note and the per-stock 原因 (avoids AI-of-AI echo)."""
+    taiex_pct = scalars.get('taiex_pct', 0.0)
+    div_thr   = tech_cfg.get('divergence_threshold', 1.5)
+    lines = [f"加權指數 {taiex_pct:+.2f}%"]
+    if scalars.get('pf_cost_total'):
+        lines.append(
+            f"持倉 現值{scalars.get('pf_value_total', 0):,.0f} · "
+            f"總損益{scalars.get('pf_gain_total', 0):+,.0f}"
+            f"({scalars.get('pf_total_pct', 0):+.1f}%) · 今日{scalars.get('pf_day_pnl', 0):+,.0f}"
+        )
+
+    def _fmt_rows(rows):
+        out = []
+        for r in rows:
+            pct = r.get('pct')
+            parts = [f"{r.get('name')}({r.get('code')})"]
+            if r.get('close') is not None:
+                parts.append(f"收{r['close']}")
+            if pct is not None:
+                parts.append(f"{pct:+.2f}%")
+            rsi = r.get('rsi')
+            if rsi is not None:
+                st = _rsi_state(rsi, tech_cfg)
+                parts.append(f"RSI{rsi}" + (f"/{st}" if st else ''))
+            if r.get('vol_ratio') is not None:
+                parts.append(f"量比{r['vol_ratio']}")
+            if pct is not None and abs(pct - taiex_pct) > div_thr:
+                parts.append("乖離大盤")
+            rets = r.get('returns') or {}
+            rstr = " ".join(f"{k}{rets[k]:+.0f}%" for k in ('1月', '3月', '1年')
+                            if rets.get(k) is not None)
+            if rstr:
+                parts.append(rstr)
+            val = r.get('valuation') or {}
+            if val.get('pe') is not None:
+                parts.append(f"PE{val['pe']:.1f}")
+            if val.get('yield') is not None:
+                parts.append(f"殖利率{val['yield']:.1f}%")
+            if val.get('margin_chg') is not None:
+                parts.append(f"融資{val['margin_chg']:+}張")
+            out.append("- " + " ".join(parts))
+        return out
+
+    if watch_data:
+        lines.append("觀察清單（當日客觀數據）:")
+        lines.extend(_fmt_rows(watch_data))
+    if holdings_data:
+        lines.append("持倉個股（當日客觀數據）:")
+        lines.extend(_fmt_rows(holdings_data))
+    return "\n".join(lines)
+
+
+def _load_pool_history(output_dir, mode, days):
+    """Last `days` distinct-date pool records for `mode`, oldest→newest, from
+    diary/pool.jsonl. Only numeric fields are ever read downstream (NO note /
+    ai_reason), so history grounding stays note-free. Empty list on any failure."""
+    if not days or days <= 0:
+        return []
+    path = os.path.join(output_dir, 'diary', 'pool.jsonl')
+    by_date = {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get('mode') == mode and rec.get('date'):
+                    by_date[rec['date']] = rec        # latest run of a date wins
+    except (FileNotFoundError, OSError):
+        return []
+    return [by_date[d] for d in sorted(by_date)][-days:]
+
+
+def _streak(pcts):
+    """Trailing consecutive same-direction run from the newest → '連N日漲/跌' or ''."""
+    vals = [p for p in pcts if p is not None]
+    if not vals or vals[-1] == 0:
+        return ''
+    up, run = vals[-1] > 0, 0
+    for v in reversed(vals):
+        if v == 0 or (v > 0) != up:
+            break
+        run += 1
+    return f"連{run}日{'漲' if up else '跌'}" if run >= 2 else ''
+
+
+def _history_digest(history, today_ctx, today_watch, max_names=15):
+    """Compact NOTE-FREE recent-trend block: pool history + today's numbers. Reads
+    only numeric fields (date / taiex_pct / pf_total_pct and per-stock code/pct) —
+    never note or ai_reason — so it cannot leak the static thesis."""
+    if not history:
+        return ''
+    md = lambda d: (d or '')[5:]                       # YYYY-MM-DD → MM-DD
+    out = [f"（歷史為近 {len(history)} 個同時段交易日，數值為當日漲跌%/報酬%）"]
+    out.append("加權指數%: " + " · ".join(
+        f"{md(r.get('date'))} {r.get('taiex_pct', 0):+.2f}" for r in history)
+        + f" · {md(today_ctx.get('date'))}(今){today_ctx.get('taiex_pct', 0):+.2f}")
+    out.append("持倉報酬%: " + " · ".join(
+        f"{md(r.get('date'))} {r.get('pf_total_pct', 0):+.1f}" for r in history)
+        + f" · {md(today_ctx.get('date'))}(今){today_ctx.get('pf_total_pct', 0):+.1f}")
+
+    hist_pct = {}                                       # code -> {date: pct}
+    for r in history:
+        for w in r.get('watchlist', []):
+            hist_pct.setdefault(w.get('code'), {})[r.get('date')] = w.get('pct')
+    rows = []
+    for w in today_watch[:max_names]:
+        code = w.get('code')
+        cells, series = [], []
+        for r in history:
+            v = hist_pct.get(code, {}).get(r.get('date'))
+            series.append(v)
+            cells.append(f"{v:+.1f}" if v is not None else "–")
+        series.append(w.get('pct'))
+        cells.append(f"{w.get('pct'):+.1f}(今)" if w.get('pct') is not None else "–(今)")
+        hint = _streak(series)
+        rows.append(f"- {w.get('name')}({code}): " + " · ".join(cells)
+                    + (f"  [{hint}]" if hint else ''))
+    if rows:
+        out.append("觀察清單近日漲跌%:")
+        out.extend(rows)
+    return "\n".join(out)
+
+
+def _build_pool_record(mode, date_str, taiex_pct, pf_day_pnl, pf_gain_total,
+                       pf_cost_total, holdings, watchlist,
+                       ai_summary='', ai_commentary='', news=None):
+    """Assemble one structured pool record: flat scalars + per-stock arrays + AI
+    text. `report_md` is filled in by _save_and_print once the archive name exists."""
+    pf_value_total = pf_cost_total + pf_gain_total
+    pf_total_pct   = (pf_gain_total / pf_cost_total * 100) if pf_cost_total else 0.0
+    return {
+        'date': date_str,
+        'mode': mode,
+        'run_utc': datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'taiex_pct': round(taiex_pct, 4),
+        'pf_cost_total': round(pf_cost_total, 2),
+        'pf_value_total': round(pf_value_total, 2),
+        'pf_day_pnl': round(pf_day_pnl, 2),
+        'pf_gain_total': round(pf_gain_total, 2),
+        'pf_total_pct': round(pf_total_pct, 4),
+        'n_holdings': len(holdings),
+        'n_watch': len(watchlist),
+        'holdings': holdings,
+        'watchlist': watchlist,
+        'ai_summary': (ai_summary or '').strip(),
+        'ai_commentary': (ai_commentary or '').strip(),
+        'news': news or [],
+        'report_md': '',
+    }
+
+
+# Flat scalar columns mirrored into metrics.csv (order defines the CSV header).
+_POOL_CSV_COLS = ['date', 'mode', 'run_utc', 'taiex_pct', 'pf_cost_total',
+                  'pf_value_total', 'pf_day_pnl', 'pf_gain_total', 'pf_total_pct',
+                  'n_holdings', 'n_watch', 'report_md']
+
+
+def append_to_pool(record, output_dir):
+    """Append one report run to the local data pool for later inference/analysis:
+    a full-fidelity JSON line in diary/pool.jsonl and a flat scalar row in
+    diary/metrics.csv. Best-effort — never raises into the report path."""
+    if not record:
+        return
+    try:
+        pool_dir = os.path.join(output_dir, 'diary')
+        os.makedirs(pool_dir, exist_ok=True)
+        with open(os.path.join(pool_dir, 'pool.jsonl'), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        csv_path = os.path.join(pool_dir, 'metrics.csv')
+        is_new = not os.path.exists(csv_path)
+        with open(csv_path, 'a', encoding='utf-8', newline='') as f:
+            w = csv.writer(f)
+            if is_new:
+                w.writerow(_POOL_CSV_COLS)
+            w.writerow([record.get(c, '') for c in _POOL_CSV_COLS])
+        print(f"[{_now()}] Pooled → {os.path.join(pool_dir, 'pool.jsonl')}")
+    except Exception as e:
+        print(f"[{_now()}] Pool error: {e}")
+
 
 def _prune_report_archive(arch_dir, keep=180):
     """Keep only the newest `keep` archived reports — caps disk growth.
@@ -1175,7 +1588,7 @@ def _prune_report_archive(arch_dir, keep=180):
         pass
 
 
-def _save_and_print(report, output_dir, filename, mode=None):
+def _save_and_print(report, output_dir, filename, mode=None, record=None):
     path = os.path.join(output_dir, filename)
     with open(path, 'w', encoding='utf-8') as f:
         f.write(report)
@@ -1192,6 +1605,10 @@ def _save_and_print(report, output_dir, filename, mode=None):
                 f.write(report)
             print(f"[{_now()}] Archived → {arch_path}")
             _prune_report_archive(arch_dir, keep=180)
+            # Structured data pool for later inference/analysis (links to this .md).
+            if record is not None:
+                record['report_md'] = os.path.basename(arch_path)
+                append_to_pool(record, output_dir)
         except Exception as e:
             print(f"[{_now()}] Archive error: {e}")
         print("\n" + "=" * 60)

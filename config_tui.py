@@ -17,7 +17,6 @@ Run:
 import json
 import os
 import sys
-import glob
 import re
 import csv
 import datetime
@@ -66,12 +65,17 @@ def _resolve_data_dir():
 DATA_DIR  = _resolve_data_dir()
 DOWNLOADS = Path.home() / 'Downloads'
 
+# Dedicated home for brokerage import CSVs — files found elsewhere (e.g. ~/Downloads)
+# are moved here after a successful import so everything lives inside the repo.
+IMPORT_DIR = SCRIPT_DIR / 'Import CSV'
+
 
 def _resolve_env_path():
     """Find the canonical .env file (outside DATA_DIR, sibling to it on disk)."""
     candidates = [
         Path(os.getenv('OPENCLAW_ENV_FILE', '')) if os.getenv('OPENCLAW_ENV_FILE') else None,
         DATA_DIR.parent / '.env',
+        Path.home() / 'openclaw-infra' / 'agents' / 'financial-bot' / '.env',
         SCRIPT_DIR / '.env',
     ]
     for p in candidates:
@@ -80,6 +84,16 @@ def _resolve_env_path():
     return DATA_DIR.parent / '.env'
 
 ENV_PATH = _resolve_env_path()
+
+# Load the agent .env into os.environ so host-side runs (Send Now → scheduler.py →
+# twse_daily_report.py, which all inherit this process env) can reach Telegram.
+# Inside Docker the vars are already injected by env_file; override=False keeps those.
+try:
+    from dotenv import load_dotenv
+    if ENV_PATH.exists():
+        load_dotenv(ENV_PATH, override=False)
+except ImportError:
+    pass
 
 
 def _config_path(filename):
@@ -312,6 +326,34 @@ def pause(msg='Press Enter to continue...'):
 
 
 # ---------------------------------------------------------------------------
+# Import file discovery
+# ---------------------------------------------------------------------------
+
+IMPORT_CSV_GLOB = '證券未實現彙總*.csv'
+
+
+def _import_csv_mtime(path: Path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0
+
+
+def find_import_csvs():
+    """Find brokerage import CSVs in the repo's Import CSV folder and under
+    ~/Downloads (fresh brokerage exports land there), newest first."""
+    files = []
+    for root in (IMPORT_DIR, DOWNLOADS):
+        if not root.exists():
+            continue
+        try:
+            files += [p for p in root.rglob(IMPORT_CSV_GLOB) if p.is_file()]
+        except OSError:
+            continue
+    return sorted(files, key=lambda p: (_import_csv_mtime(p), str(p)), reverse=True)
+
+
+# ---------------------------------------------------------------------------
 # Main menu
 # ---------------------------------------------------------------------------
 
@@ -320,13 +362,14 @@ def main_menu():
         portfolio = load_json(_config_path('portfolio.json'))
         tracked   = load_json(_config_path('tracked_stocks.json'))
         total_cost = sum(v.get('cost_basis', 0) for v in portfolio.values())
+        import_count = len(find_import_csvs())
 
         t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
         t.add_column(style='bold cyan', width=4)
         t.add_column(style='white', width=26)
         t.add_column(style='dim')
         t.add_row('[1]', 'Portfolio Holdings',
-                  f'{len(portfolio)} stocks · {total_cost:,.0f}元 · [i] import CSV')
+                  f'{len(portfolio)} stocks · {total_cost:,.0f}元 · {import_count} import CSV')
         t.add_row('[2]', 'Watchlist',
                   f'{len(tracked)} monitored (non-holding)')
         t.add_row('[3]', 'Report Schedule',
@@ -339,6 +382,8 @@ def main_menu():
                   'sandbox preview · ⚠ live send')
         t.add_row('[7]', 'Delivery & Keys',
                   f'Telegram · OpenRouter · Brave ({ENV_PATH.name})')
+        t.add_row('[8]', 'Market Diary',
+                  'browse archived reports · year/month/date')
         t.add_row('[q]', 'Quit', '')
         # Anchor the app-wide uniform title-box width to this (widest) home table,
         # so every page that follows draws an identically sized box.
@@ -347,7 +392,7 @@ def main_menu():
         header('TWSE Daily Report — orchestration')
         console.print(t)
 
-        choice = Prompt.ask('\nSelect', choices=['1','2','3','4','5','6','7','q'], default='q')
+        choice = Prompt.ask('\nSelect', choices=['1','2','3','4','5','6','7','8','q'], default='q')
 
         if   choice == '1': menu_portfolio()
         elif choice == '2': menu_watchlist()
@@ -356,9 +401,144 @@ def main_menu():
         elif choice == '5': menu_ai_settings()
         elif choice == '6': menu_sandbox()
         elif choice == '7': menu_api_keys()
+        elif choice == '8': menu_diary()
         else:
             console.print('\n[dim]Goodbye.[/dim]\n')
             break
+
+
+# ---------------------------------------------------------------------------
+# [8] Market Diary — browse archived reports by year / month / date
+# ---------------------------------------------------------------------------
+
+_DIARY_RE = re.compile(r'^twse_(\d{4})-(\d{2})-(\d{2})_\d{4}_(morning|closing)\.md$')
+
+
+def _scan_reports():
+    """Return ({year: {month: {date: {mode: filename}}}}, reports_dir) from the
+    archive. Latest run per (date, mode) wins (filenames sort chronologically).
+    Days with no report (weekends/holidays) simply never appear."""
+    reports_dir = _config_path('reports')
+    idx = {}
+    try:
+        files = sorted(os.listdir(reports_dir))
+    except (FileNotFoundError, NotADirectoryError):
+        return idx, reports_dir
+    for f in files:
+        m = _DIARY_RE.match(f)
+        if not m:
+            continue
+        y, mo, d, mode = m.groups()
+        idx.setdefault(y, {}).setdefault(mo, {}).setdefault(f'{y}-{mo}-{d}', {})[mode] = f
+    return idx, reports_dir
+
+
+def _view_report(path):
+    try:
+        content = open(path, encoding='utf-8').read()
+    except OSError as e:
+        console.print(f'[red]Cannot open: {e}[/red]'); pause(); return
+    console.clear()
+    console.rule(f'[cyan]{os.path.basename(path)}[/cyan]')
+    console.print(content, markup=False, highlight=False)   # report text is literal
+    console.rule()
+    pause()
+
+
+def _diary_export(filenames, reports_dir):
+    dest = Prompt.ask('Export to directory', default=str(Path.home()))
+    dpath = Path(dest).expanduser()
+    try:
+        dpath.mkdir(parents=True, exist_ok=True)
+        for fn in filenames:
+            shutil.copy(os.path.join(reports_dir, fn), dpath / fn)
+        console.print(f'[green]✓ Exported {len(filenames)} file(s) → {dpath}[/green]')
+    except Exception as e:
+        console.print(f'[red]Export failed: {e}[/red]')
+    pause()
+
+
+def _diary_date(modes, date, reports_dir):
+    while True:
+        header(f'Market Diary — {date}')
+        available = [m for m in ('closing', 'morning') if m in modes]
+        t = Table(box=box.ROUNDED)
+        t.add_column('Key', style='bold cyan'); t.add_column('Report'); t.add_column('File', style='dim')
+        keymap = {}
+        for m in available:
+            k = m[0]                       # 'c' / 'm'
+            keymap[k] = modes[m]
+            t.add_row(f'[{k}]', m, modes[m])
+        console.print(t)
+        console.print('\n[cyan][c/m][/cyan] view  [cyan][x][/cyan] export both  [cyan][b][/cyan] back')
+        pick = Prompt.ask('Action', choices=list(keymap) + ['x', 'b'], default='b')
+        if pick == 'b':
+            return
+        if pick == 'x':
+            _diary_export(list(keymap.values()), reports_dir)
+        else:
+            _view_report(os.path.join(reports_dir, keymap[pick]))
+
+
+def _diary_month(dates, year, month, reports_dir):
+    while True:
+        header(f'Market Diary — {year}-{month}')
+        dkeys = sorted(dates.keys(), reverse=True)      # gap days absent by construction
+        t = Table(box=box.ROUNDED)
+        t.add_column('#', style='dim', width=4, justify='right')
+        t.add_column('Date', style='bold cyan')
+        t.add_column('Reports', style='dim')
+        for i, dt in enumerate(dkeys, 1):
+            tag = ' · '.join(m for m in ('morning', 'closing') if m in dates[dt])
+            t.add_row(str(i), dt, tag)
+        console.print(t)
+        console.print('\n[dim]Enter a row #, or [b] back[/dim]')
+        pick = Prompt.ask('Row', default='b')
+        if pick == 'b':
+            return
+        if pick.isdigit() and 1 <= int(pick) <= len(dkeys):
+            key = dkeys[int(pick) - 1]
+            _diary_date(dates[key], key, reports_dir)
+        else:
+            console.print('[red]Invalid selection.[/red]'); pause()
+
+
+def _diary_year(months, year, reports_dir):
+    while True:
+        header(f'Market Diary — {year}')
+        mkeys = sorted(months.keys(), reverse=True)
+        t = Table(box=box.ROUNDED)
+        t.add_column('Month', style='bold cyan'); t.add_column('Trading days', style='dim')
+        for mo in mkeys:
+            t.add_row(f'{year}-{mo}', f'{len(months[mo])} days')
+        console.print(t)
+        console.print('\n[dim]Enter a month (MM), or [b] back[/dim]')
+        pick = Prompt.ask('Month', choices=mkeys + ['b'], default='b')
+        if pick == 'b':
+            return
+        _diary_month(months[pick], year, pick, reports_dir)
+
+
+def menu_diary():
+    while True:
+        idx, reports_dir = _scan_reports()
+        header('Market Diary — archived reports')
+        if not idx:
+            console.print('[dim]No archived reports yet — they appear after the first '
+                          'live report run (data/reports/).[/dim]')
+            pause(); return
+        years = sorted(idx.keys(), reverse=True)
+        t = Table(box=box.ROUNDED)
+        t.add_column('Year', style='bold cyan'); t.add_column('Trading days', style='dim')
+        for y in years:
+            ndays = sum(len(mo) for mo in idx[y].values())
+            t.add_row(y, f'{ndays} days')
+        console.print(t)
+        console.print('\n[dim]Enter a year, or [b] back[/dim]')
+        pick = Prompt.ask('Year', choices=years + ['b'], default='b')
+        if pick == 'b':
+            return
+        _diary_year(idx[pick], pick, reports_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -393,20 +573,36 @@ def _portfolio_table(portfolio, table=None):
 def menu_portfolio():
     while True:
         portfolio = load_json(_config_path('portfolio.json'))
+        import_count = len(find_import_csvs())
         header('Portfolio Holdings')
         _portfolio_table(portfolio)
 
         console.print('\n[cyan][a][/cyan] Add  [cyan][e][/cyan] Edit  '
-                      '[cyan][d][/cyan] Delete  [cyan][i][/cyan] Import CSV  '
-                      '[cyan][m][/cyan] Mappings  [cyan][b][/cyan] Back')
-        choice = Prompt.ask('Action', choices=['a','e','d','i','m','b'], default='b')
+                      f'[cyan][d][/cyan] Delete  [cyan][i][/cyan] Import CSV ({import_count})  '
+                      '[cyan][m][/cyan] Mappings  [cyan][g][/cyan] Graphs  [cyan][b][/cyan] Back')
+        choice = Prompt.ask('Action', choices=['a','e','d','i','m','g','b'], default='b')
 
         if   choice == 'a': _portfolio_add(portfolio)
         elif choice == 'e': _portfolio_edit(portfolio)
         elif choice == 'd': _portfolio_delete(portfolio)
         elif choice == 'i': menu_import_csv()
         elif choice == 'm': _menu_name_mappings()
+        elif choice == 'g': _menu_graphs(portfolio)
         else: break
+
+
+def _menu_graphs(portfolio):
+    """Live holdings table + candlestick graphs (total first, then per stock)."""
+    try:
+        import live_portfolio
+    except ImportError:
+        console.print('[yellow]Graphs need plotext: pip install plotext[/yellow]')
+        pause(); return
+    try:
+        live_portfolio.graphs_view(console, portfolio, DATA_DIR)
+    except Exception as e:
+        console.print(f'[red]Graphs view failed: {e}[/red]')
+        pause()
 
 
 def _portfolio_add(portfolio):
@@ -684,30 +880,39 @@ def _resolve_names(rows: list):
 def menu_import_csv():
     header('Import CSV — 證券未實現彙總')
 
-    pattern = str(DOWNLOADS / '證券未實現彙總*.csv')
-    files   = sorted(glob.glob(pattern), reverse=True)
+    files = find_import_csvs()
 
     if not files:
-        console.print(f'[yellow]No matching CSV files found in {DOWNLOADS}[/yellow]')
-        console.print('[dim]Export from your brokerage app and drop into ~/Downloads/[/dim]')
+        console.print(f'[yellow]No matching CSV files found in {IMPORT_DIR} or {DOWNLOADS}[/yellow]')
+        console.print(f'[dim]Export from your brokerage app and drop into "{IMPORT_DIR.name}/" or ~/Downloads/.[/dim]')
         pause(); return
 
     t = Table(box=box.SIMPLE, show_header=True)
     t.add_column('#',    style='dim', width=3)
-    t.add_column('File', width=50)
+    t.add_column('File', width=58)
     t.add_column('Modified', style='dim')
-    for i, f in enumerate(files[:8], 1):
-        mtime = datetime.datetime.fromtimestamp(os.path.getmtime(f)).strftime('%Y-%m-%d %H:%M')
-        t.add_row(str(i), os.path.basename(f), mtime)
+    display_files = files[:12]
+    for i, f in enumerate(display_files, 1):
+        mtime = datetime.datetime.fromtimestamp(_import_csv_mtime(f)).strftime('%Y-%m-%d %H:%M')
+        for base in (IMPORT_DIR, DOWNLOADS):
+            try:
+                label = f'{base.name}/{f.relative_to(base)}'
+                break
+            except ValueError:
+                label = str(f)
+        t.add_row(str(i), label, mtime)
+    console.print(f'[dim]Found [bold]{len(files)}[/bold] import CSV(s) in "{IMPORT_DIR.name}" and {DOWNLOADS}[/dim]')
+    if len(files) > len(display_files):
+        console.print(f'[dim]Showing newest {len(display_files)} files.[/dim]')
     console.print(t)
 
     idx = Prompt.ask('Select file number', default='1')
     try:
-        selected = files[int(idx) - 1]
+        selected = display_files[int(idx) - 1]
     except (ValueError, IndexError):
         console.print('[red]Invalid selection.[/red]'); pause(); return
 
-    console.print(f'\n[dim]Parsing {os.path.basename(selected)}...[/dim]')
+    console.print(f'\n[dim]Parsing {selected.name}...[/dim]')
     rows = _parse_brokerage_csv(selected)
     if not rows:
         console.print('[red]No valid rows found.[/red]'); pause(); return
@@ -770,8 +975,25 @@ def menu_import_csv():
     if Confirm.ask('\nApply to portfolio.json?'):
         save_json(_config_path('portfolio.json'), new_portfolio)
         console.print(f'[green]✓ Portfolio updated — {len(new_portfolio)} holdings, {new_total:,.0f}元[/green]')
+        _archive_import_csv(selected)
 
     pause()
+
+
+def _archive_import_csv(path: Path):
+    """Move an imported CSV into the repo's Import CSV folder (no-op if already there)."""
+    try:
+        if IMPORT_DIR in path.parents:
+            return
+        IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+        dest = IMPORT_DIR / path.name
+        if dest.exists():
+            stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            dest = IMPORT_DIR / f'{path.stem}_{stamp}{path.suffix}'
+        shutil.move(str(path), str(dest))
+        console.print(f'[dim]Moved {path.name} → {IMPORT_DIR.name}/[/dim]')
+    except OSError as e:
+        console.print(f'[yellow]Could not move {path.name} into {IMPORT_DIR}: {e}[/yellow]')
 
 
 def _menu_name_mappings():
@@ -897,6 +1119,7 @@ def menu_sandbox():
 # Verified valid on OpenRouter (2026-06). The old 'anthropic/claude-haiku-3-5'
 # id was invalid (HTTP 400) — it silently no-op'd every AI call.
 AVAILABLE_MODELS = [
+    'anthropic/claude-opus-4.8',
     'anthropic/claude-haiku-4.5',
     'anthropic/claude-3-haiku',
     'google/gemini-2.5-flash-lite-preview-09-2025',
@@ -921,6 +1144,8 @@ def menu_ai_settings():
         t.add_row('Max tokens — 報告總結 (summary)',  str(ai.get('max_tokens_summary', 400)))
         t.add_row('Summary model (報告總結)',          ai.get('summary_model') or '(uses Model)')
         t.add_row('Summary key env',                  ai.get('summary_key_env', 'OPENROUTER_API_KEY'))
+        t.add_row('Summary temperature',              str(ai.get('summary_temperature', 0.3)))
+        t.add_row('Summary history days (0=off)',      str(ai.get('summary_history_days', 5)))
         console.print(t)
         console.print()
 
@@ -1003,9 +1228,23 @@ def menu_ai_settings():
                 ai['max_tokens_summary'] = int(tok)
             except ValueError:
                 console.print('[red]Invalid tokens, kept previous.[/red]')
+            temp = Prompt.ask('報告總結 temperature (0=deterministic, ~0.3 recommended)',
+                              default=str(ai.get('summary_temperature', 0.3)))
+            try:
+                ai['summary_temperature'] = float(temp)
+            except ValueError:
+                console.print('[red]Invalid temperature, kept previous.[/red]')
+            hist = Prompt.ask('報告總結 history days — feed recent pool trend (0=off)',
+                              default=str(ai.get('summary_history_days', 5)))
+            try:
+                ai['summary_history_days'] = max(0, int(hist))
+            except ValueError:
+                console.print('[red]Invalid history days, kept previous.[/red]')
             save_bot_config(cfg)
             console.print(f"[green]✓ Summary engine: model={ai.get('summary_model') or '(Model)'}, "
-                          f"key_env={ai['summary_key_env']}, tokens={ai.get('max_tokens_summary', 400)}.[/green]")
+                          f"key_env={ai['summary_key_env']}, tokens={ai.get('max_tokens_summary', 400)}, "
+                          f"temp={ai.get('summary_temperature', 0.3)}, "
+                          f"history={ai.get('summary_history_days', 5)}d.[/green]")
             pause()
 
         else:
