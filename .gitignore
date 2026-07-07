@@ -16,3 +16,11 @@ twse_daily_report.md
 portfolio.json
 Import CSV/
 data/
+*.env
+.env.*
+!.env.template
+!.env.example
+*.pem
+*.key
+auth-profiles.json
+credentials/
