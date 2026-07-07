@@ -1,0 +1,17 @@
+# Keep the Docker build context small and secret-free.
+.git/
+.venv/
+__pycache__/
+*.pyc
+data/
+logs/
+Import CSV/
+.env
+*.env
+.env.*
+sandbox_preview_*.txt
+twse_daily_report.md
+.DS_Store
+src/
+.conda/
+scripts/git-hooks/
