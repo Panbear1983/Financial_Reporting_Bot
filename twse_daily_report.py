@@ -14,6 +14,7 @@ import csv
 import os
 import re
 import sys
+import time
 import datetime
 import xml.etree.ElementTree as ET
 import requests
@@ -232,18 +233,26 @@ def _send_telegram(token, chat_id, text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     ok_all = True
     for chunk in [text[i:i + 4000] for i in range(0, len(text), 4000)]:
-        try:
-            resp = requests.post(
-                url, json={"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"},
-                timeout=15)
-            if resp.ok:
-                print(f"[{_now()}] Telegram sent → {chat_id}.")
-            else:
-                print(f"[{_now()}] Telegram failed ({chat_id}): {resp.text}")
-                ok_all = False
-        except Exception as e:
-            print(f"[{_now()}] Telegram error ({chat_id}): {e}")
-            ok_all = False
+        # Retry transient failures (e.g. brief "Network is unreachable" blips) so a
+        # single dropped chunk doesn't silently deliver half a report.
+        sent = False
+        for attempt, delay in ((1, 2), (2, 5), (3, 0)):
+            try:
+                resp = requests.post(
+                    url, json={"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"},
+                    timeout=15)
+                if resp.ok:
+                    print(f"[{_now()}] Telegram sent → {chat_id}.")
+                    sent = True
+                    break
+                print(f"[{_now()}] Telegram failed ({chat_id}, attempt {attempt}): {resp.text}")
+                if resp.status_code < 500:
+                    break  # 4xx won't heal on retry (bad markup, bad chat, rate-limit body)
+            except Exception as e:
+                print(f"[{_now()}] Telegram error ({chat_id}, attempt {attempt}): {e}")
+            if delay:
+                time.sleep(delay)
+        ok_all = ok_all and sent
     return ok_all
 
 
