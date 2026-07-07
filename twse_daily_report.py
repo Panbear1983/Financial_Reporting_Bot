@@ -226,28 +226,42 @@ def send_telegram_report(text):
 
 
 def _send_telegram(token, chat_id, text):
-    """Send one report to one Telegram destination (chunked at 4000). Returns bool."""
+    """Send one report to one Telegram destination (chunked at line boundaries,
+    ≤4000 chars). Returns bool."""
     if not token or not chat_id:
         print(f"[{_now()}] Telegram destination missing token/chat_id, skipping.")
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     ok_all = True
-    for chunk in [text[i:i + 4000] for i in range(0, len(text), 4000)]:
+    # Split on line boundaries (not raw 4000-char slices) so a Markdown entity
+    # like **bold** is never cut in half across a chunk boundary — that split was
+    # what produced Telegram's "can't parse entities" 400 and dropped a chunk.
+    for chunk in _line_safe_chunks(text, limit=4000):
+        # Two payloads: formatted first, then a plain-text fallback. If Markdown
+        # parsing still fails on a chunk, resend it without parse_mode so the
+        # content always reaches the channel instead of being silently dropped.
+        payloads = (
+            {"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"},
+            {"chat_id": chat_id, "text": chunk},
+        )
+        payload_i = 0
         # Retry transient failures (e.g. brief "Network is unreachable" blips) so a
         # single dropped chunk doesn't silently deliver half a report.
         sent = False
         for attempt, delay in ((1, 2), (2, 5), (3, 0)):
             try:
-                resp = requests.post(
-                    url, json={"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"},
-                    timeout=15)
+                resp = requests.post(url, json=payloads[payload_i], timeout=15)
                 if resp.ok:
                     print(f"[{_now()}] Telegram sent → {chat_id}.")
                     sent = True
                     break
                 print(f"[{_now()}] Telegram failed ({chat_id}, attempt {attempt}): {resp.text}")
+                if (resp.status_code == 400 and payload_i == 0
+                        and "parse entities" in resp.text):
+                    payload_i = 1   # drop Markdown, resend same chunk as plain text
+                    continue        # immediate retry, no backoff
                 if resp.status_code < 500:
-                    break  # 4xx won't heal on retry (bad markup, bad chat, rate-limit body)
+                    break  # other 4xx won't heal on retry (bad chat, rate-limit body)
             except Exception as e:
                 print(f"[{_now()}] Telegram error ({chat_id}, attempt {attempt}): {e}")
             if delay:
