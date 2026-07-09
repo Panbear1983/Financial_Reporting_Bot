@@ -33,6 +33,23 @@ from custom_stock_lookup import get_yfinance_data
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR   = os.getenv('OPENCLAW_DATA_DIR', os.path.join(SCRIPT_DIR, 'data'))
 
+# Load .env for standalone/preview runs (OPENROUTER_* / TELEGRAM_* / BRAVE_API_KEY).
+# Honours OPENCLAW_ENV_FILE, else the data-dir / script-dir .env. override=False so
+# an already-populated container environment is never clobbered. Silent no-op if
+# python-dotenv is absent — matches config_tui.py's pattern.
+def _load_env_file():
+    for cand in (os.getenv('OPENCLAW_ENV_FILE'),
+                 os.path.join(DATA_DIR, '.env'),
+                 os.path.join(SCRIPT_DIR, '.env')):
+        if cand and os.path.exists(cand):
+            try:
+                from dotenv import load_dotenv
+                load_dotenv(cand, override=False)
+            except Exception:
+                pass
+            return
+_load_env_file()
+
 def _config_path(filename):
     """Prefer data-dir (persistent volume) over script-dir (image layer)."""
     data_path = os.path.join(DATA_DIR, filename)
@@ -43,6 +60,8 @@ def _config_path(filename):
 
 def load_tracked_stocks():
     path = _config_path('tracked_stocks.json')
+    if not os.path.exists(path):
+        return {}
     with open(path, 'r', encoding='utf-8') as f:
         raw = json.load(f)
     # Values may be a plain name (legacy) or {"name": ..., "note": ...}.
@@ -60,6 +79,8 @@ def load_tracked_notes():
     report to surface the note under each watchlist line.
     """
     path = _config_path('tracked_stocks.json')
+    if not os.path.exists(path):
+        return {}
     with open(path, 'r', encoding='utf-8') as f:
         raw = json.load(f)
     return {
@@ -326,6 +347,161 @@ def get_market_sentiment(pct):
 
 
 # ---------------------------------------------------------------------------
+# Yahoo batch / cache layer
+#
+# The urllib chart endpoint used by custom_stock_lookup.get_yfinance_data is
+# hard rate-limited (HTTP 429) on this host, while the yfinance library path
+# (curl_cffi browser-impersonating session) is not. A report used to fire ~4
+# indices + TAIEX + ~30×(quote + technicals + period-returns) individual calls
+# and trip 429, blanking data. This layer collapses that into a couple of
+# batched yf.download() calls and reuses the results from an in-run cache, so
+# the same symbol is never fetched twice. It also resolves each code's
+# .TW/.TWO suffix from ticker_suffix_cache.json (extending it) instead of
+# always trying .TW first and eating a 404.
+# ---------------------------------------------------------------------------
+
+_HISTORY_CACHE = {}     # bare code -> DataFrame (daily OHLCV, up to 1y)
+_INDEX_CACHE   = {}     # index symbol (^GSPC…) -> DataFrame (daily OHLCV)
+_QUOTE_CACHE   = {}     # full symbol (2330.TW) -> get_yfinance_data dict|None
+
+
+def _suffix_cache_path():
+    return os.path.join(DATA_DIR, 'ticker_suffix_cache.json')
+
+
+def _load_suffix_cache():
+    try:
+        with open(_suffix_cache_path(), encoding='utf-8') as f:
+            c = json.load(f)
+            return c if isinstance(c, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_suffix_cache(cache):
+    try:
+        with open(_suffix_cache_path(), 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        if os.getenv('FRB_DEBUG_FETCH'):
+            print(f"[{_now()}] suffix cache save failed: {e}")
+
+
+def _suffix_order(code):
+    """Preferred suffix probe order for a code: cached suffix first, then the other."""
+    cached = _load_suffix_cache().get(code)
+    order = [cached] if cached in ('.TW', '.TWO') else []
+    order += [s for s in ('.TW', '.TWO') if s not in order]
+    return order
+
+
+def _split_download(df, symbols):
+    """Split a group_by='ticker' yf.download frame into {symbol: non-empty DataFrame}."""
+    out = {}
+    if df is None or getattr(df, 'empty', True):
+        return out
+    if isinstance(df.columns, pd.MultiIndex):
+        level0 = set(df.columns.get_level_values(0))
+        for s in symbols:
+            if s in level0:
+                sub = df[s].dropna(how='all')
+                if not sub.empty:
+                    out[s] = sub
+    else:  # single-ticker downloads come back flat
+        sub = df.dropna(how='all')
+        if not sub.empty and symbols:
+            out[symbols[0]] = sub
+    return out
+
+
+def prefetch_stock_histories(codes, period='1y'):
+    """One batched yf.download for every watchlist/holding code → _HISTORY_CACHE.
+
+    Codes with a known suffix (ticker_suffix_cache.json) download that symbol;
+    unknown codes download BOTH .TW and .TWO in the same batch and keep whichever
+    Yahoo returns data for, persisting the resolved suffix. auto_adjust=True matches
+    yfinance's Ticker.history() default so downstream RSI / 量比 / 績效 values are
+    unchanged vs the old per-stock calls. Best-effort: on failure the cache stays
+    empty and callers fall back to individual fetches."""
+    codes = list(dict.fromkeys(c for c in codes if c))   # dedupe, keep order
+    if not codes:
+        return
+    cache = _load_suffix_cache()
+    symbols = []
+    for code in codes:
+        suf = cache.get(code)
+        if suf in ('.TW', '.TWO'):
+            symbols.append(f"{code}{suf}")
+        else:
+            symbols += [f"{code}.TW", f"{code}.TWO"]
+    try:
+        df = yf.download(symbols, period=period, interval='1d', group_by='ticker',
+                         auto_adjust=True, threads=True, progress=False)
+    except Exception as e:
+        if os.getenv('FRB_DEBUG_FETCH'):
+            print(f"[{_now()}] batch history download failed: {e}")
+        return
+    parts = _split_download(df, symbols)
+    dirty = False
+    for code in codes:
+        suf = cache.get(code)
+        cands = ([f"{code}{suf}"] if suf in ('.TW', '.TWO')
+                 else [f"{code}.TW", f"{code}.TWO"])
+        chosen = next((s for s in cands if s in parts), None)
+        if chosen:
+            _HISTORY_CACHE[code] = parts[chosen]
+            new_suf = chosen[len(code):]
+            if cache.get(code) != new_suf:
+                cache[code] = new_suf
+                dirty = True
+    if dirty:
+        _save_suffix_cache(cache)
+    if os.getenv('FRB_DEBUG_FETCH'):
+        print(f"[{_now()}] prefetch: {len(_HISTORY_CACHE)}/{len(codes)} codes have history")
+
+
+def _slice_period(df, period):
+    """Mimic yfinance Ticker.history(period=…) from a cached longer frame.
+    'Nd' → last N rows (yfinance '20d' empirically returns 20 trading rows, so
+    tail(N) preserves the exact RSI / 量比 window); anything else → full frame."""
+    if df is None or getattr(df, 'empty', True):
+        return df
+    if period.endswith('d'):
+        try:
+            return df.tail(int(period[:-1]))
+        except ValueError:
+            return df
+    return df
+
+
+def _quote_from_history(code):
+    """Build a get_yfinance_data-shaped quote from cached daily history (no network).
+    Used to avoid the 429-throttled urllib chart endpoint for per-stock quotes."""
+    h = _HISTORY_CACHE.get(code)
+    if h is None or getattr(h, 'empty', True) or 'Close' not in h.columns:
+        return None
+    closes = h['Close'].dropna()
+    if len(closes) < 2:
+        return None
+    price, prev = float(closes.iloc[-1]), float(closes.iloc[-2])
+    opens = h['Open'].dropna() if 'Open' in h.columns else pd.Series(dtype=float)
+    today_open = float(opens.iloc[-1]) if len(opens) else prev
+    return {
+        'name': code, 'price': price, 'prev_close': prev, 'today_open': today_open,
+        'change': price - prev, 'intraday_change': price - today_open,
+    }
+
+
+def _cached_get_yfinance(symbol):
+    """get_yfinance_data with an in-run cache so a symbol is never fetched twice."""
+    if symbol in _QUOTE_CACHE:
+        return _QUOTE_CACHE[symbol]
+    d = get_yfinance_data(symbol)
+    _QUOTE_CACHE[symbol] = d
+    return d
+
+
+# ---------------------------------------------------------------------------
 # Scrapers — numbers only, no AI
 # ---------------------------------------------------------------------------
 
@@ -351,8 +527,25 @@ def fetch_taiex():
         return None
 
 
+def _prefetch_indices(symbols):
+    """One batched yf.download for global indices → _INDEX_CACHE. The urllib chart
+    path is 429-throttled on this host; the yfinance batch path is not, so this is
+    what actually populates the global-market section."""
+    symbols = [s for s in dict.fromkeys(symbols) if s and s not in _INDEX_CACHE]
+    if not symbols:
+        return
+    try:
+        df = yf.download(symbols, period='5d', interval='1d', group_by='ticker',
+                         auto_adjust=True, threads=True, progress=False)
+    except Exception as e:
+        if os.getenv('FRB_DEBUG_FETCH'):
+            print(f"[{_now()}] index batch download failed: {e}")
+        return
+    _INDEX_CACHE.update(_split_download(df, symbols))
+
+
 def fetch_global_indices(indices=None):
-    """Returns list of formatted strings — scraped from Yahoo Finance."""
+    """Returns list of formatted strings — scraped from Yahoo Finance (batched)."""
     if not indices:
         indices = [
             ('S&P 500',    '^GSPC'),
@@ -360,10 +553,19 @@ def fetch_global_indices(indices=None):
             ('費城半導體', '^SOX'),
             ('日經225',    '^N225'),
         ]
+    _prefetch_indices([s for _, s in indices])
     lines = []
     for name, sym in indices:
-        d = get_yfinance_data(sym)
-        if d:
+        d = None
+        sub = _INDEX_CACHE.get(sym)
+        if sub is not None and not sub.empty and 'Close' in sub.columns:
+            closes = sub['Close'].dropna()
+            if len(closes) >= 2:
+                price, prev = float(closes.iloc[-1]), float(closes.iloc[-2])
+                d = {'price': price, 'prev_close': prev, 'change': price - prev}
+        if d is None:   # last-ditch single call (usually 429 on this host)
+            d = _cached_get_yfinance(sym)
+        if d and d.get('prev_close'):
             pct = d['change'] / d['prev_close'] * 100
             lines.append(f"• {name}：{d['price']:,.2f} ({pct:+.2f}%)")
         else:
@@ -372,9 +574,20 @@ def fetch_global_indices(indices=None):
 
 
 def _ticker_history(code, period='20d'):
-    """Fetch yfinance history, trying .TW (TWSE) then .TWO (TPEX/上櫃)."""
-    for suffix in ('.TW', '.TWO'):
-        hist = yf.Ticker(f"{code}{suffix}").history(period=period)
+    """yfinance daily history for a Taiwan code.
+
+    Serves from the batched _HISTORY_CACHE (populated by prefetch_stock_histories)
+    when available — this is the common path and avoids per-stock network calls.
+    Falls back to an individual fetch that probes the cached/known suffix first
+    (then the other), so a .TWO stock no longer wastes a .TW 404."""
+    cached = _HISTORY_CACHE.get(code)
+    if cached is not None and not cached.empty:
+        return _slice_period(cached, period)
+    for suffix in _suffix_order(code):
+        try:
+            hist = yf.Ticker(f"{code}{suffix}").history(period=period)
+        except Exception:
+            hist = pd.DataFrame()
         if not hist.empty:
             return hist
     return pd.DataFrame()
@@ -422,9 +635,16 @@ def fetch_stock_technicals(code, opening_mode=False, period_days=20):
 
 
 def fetch_yfinance_stock(code):
-    """Live price data for a single Taiwan stock. Tries .TW then .TWO."""
-    for suffix in ('.TW', '.TWO'):
-        d = get_yfinance_data(f"{code}{suffix}")
+    """Price data for a single Taiwan stock.
+
+    Prefers a quote derived from the batched history cache (no network, dodges the
+    429-throttled chart endpoint); falls back to the urllib chart API, probing the
+    cached/known suffix first (then the other) with an in-run quote cache."""
+    q = _quote_from_history(code)
+    if q:
+        return q
+    for suffix in _suffix_order(code):
+        d = _cached_get_yfinance(f"{code}{suffix}")
         if d:
             return d
     return None
@@ -467,6 +687,48 @@ def fetch_tpex_all():
     except Exception as e:
         print(f"[{_now()}] TPEX fetch failed: {e}")
         return []
+
+
+def fetch_tpex_emerging():
+    """TPEX 興櫃 (emerging board) latest stats → {code: TWSE-row-shaped dict}.
+
+    Covers codes absent from both STOCK_DAY_ALL (listed) and the TPEX mainboard feed
+    — e.g. 3595 山太士, 7924 台灣微脂體 — which otherwise render 今日無交易數據. The
+    emerging board trades on a 加權平均價 (no opening auction), so 開盤/收盤 both use
+    Average and the day change is Average vs PreviousAveragePrice. Rows carry
+    _fallback='tpex_esb' so the line is tagged 興櫃均價 (official TPEX data, not Yahoo).
+    Best-effort → {}."""
+    def _f(v):
+        try:
+            return float(str(v).replace(',', '').strip())
+        except (TypeError, ValueError):
+            return None
+    out = {}
+    try:
+        r = requests.get('https://www.tpex.org.tw/openapi/v1/tpex_esb_latest_statistics',
+                         headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+        for s in r.json():
+            code = (s.get('SecuritiesCompanyCode') or '').strip()
+            avg  = _f(s.get('Average'))
+            if not code or avg is None or avg <= 0:
+                continue
+            prev   = _f(s.get('PreviousAveragePrice'))
+            prevc  = prev if (prev is not None and prev > 0) else avg
+            change = avg - prevc
+            out[code] = {
+                'Code': code, 'Name': (s.get('CompanyName') or '').strip(),
+                'Date': (s.get('Date') or '').strip(),
+                'OpeningPrice': f"{avg:.2f}", 'ClosingPrice': f"{avg:.2f}",
+                'TradeVolume': str(int(_f(s.get('TransactionVolume')) or 0)),
+                '_change': change, '_close': avg,
+                '_pct': (change / prevc * 100) if prevc else 0.0,
+                '_vol': int(_f(s.get('TransactionVolume')) or 0),
+                '_fallback': 'tpex_esb',
+            }
+        print(f"[{_now()}] TPEX emerging (興櫃): {len(out)} stocks")
+    except Exception as e:
+        print(f"[{_now()}] TPEX emerging fetch failed: {e}")
+    return out
 
 
 def fetch_valuation():
@@ -628,9 +890,13 @@ def _twse_row_from_yfinance(code):
 
 
 def _src_tag(row):
-    """Inline marker for closing lines sourced via the yfinance fallback rather than
-    TWSE official data — signals the reader the volume figure is not an official 量."""
-    return "（yfinance 報價）" if row.get('_fallback') else ""
+    """Inline source marker for closing lines not sourced from TWSE/TPEX mainboard
+    official close: 興櫃均價 for the emerging board (加權平均價, no true 開/收 or 量
+    convention), 或 yfinance 報價 for the Yahoo fallback (volume is not an official 量)."""
+    fb = row.get('_fallback')
+    if fb == 'tpex_esb':
+        return "（興櫃均價）"
+    return "（yfinance 報價）" if fb else ""
 
 
 # ---------------------------------------------------------------------------
@@ -686,9 +952,10 @@ def ai_report_summary(report_text, cfg, digest='', history=''):
     temperature = ai_cfg.get('summary_temperature', 0.3)
     system = (
         "你是一位嚴謹的台股分析師。只根據所提供的『當日客觀數據』、『近期走勢』與報告內容進行分析，"
-        "不得臆測使用者的選股理由或動機（報告不含使用者備註）。對觀察清單，"
-        "請依當日價格動作、技術指標（RSI／量比／乖離）與 1月／3月／1年 報酬給出判斷，"
+        "不得臆測使用者的選股理由或動機（報告不含使用者備註）。分析聚焦於大盤與持倉個股，"
+        "依當日價格動作、技術指標（RSI／量比／乖離）、融資與 1月／3月／1年 報酬給出判斷，"
         "並可參考近期走勢指出趨勢與連續性（如連續數日漲跌、與昨日比較），但結論仍以當日數據為主。"
+        "不需分析觀察清單。"
     )
     parts = []
     if digest:
@@ -701,9 +968,10 @@ def ai_report_summary(report_text, cfg, digest='', history=''):
     )
     parts.append(
         "請撰寫「報告總結」（繁體中文，精簡條列）：\n"
-        "1. 今日重點與持倉整體狀況（可對比近期走勢指出趨勢）；\n"
-        "2. 【觀察清單】逐檔給出 值得關注／觀望／回避 的判斷，並以當日數據佐證（可引用關鍵數字、點出連續性）；\n"
-        "3. 需留意的風險。"
+        "1. 大盤與市場概況（可對比全球市場與近期走勢指出趨勢）；\n"
+        "2. 持倉個股逐檔重點與整體狀況（引用當日 RSI／量比／融資／報酬與連續性佐證）；\n"
+        "3. 需留意的風險。\n"
+        "僅分析大盤與持倉，不要納入觀察清單。"
     )
     prompt = "\n\n".join(parts)
     try:
@@ -718,6 +986,7 @@ def fetch_brave_news(query='台股 今日 財經', count=5):
     """Fetch latest financial news headlines via Brave Search API."""
     api_key = os.getenv('BRAVE_API_KEY')
     if not api_key:
+        print(f"[{_now()}] Brave news skipped: BRAVE_API_KEY not set.")
         return []
     try:
         resp = requests.get(
@@ -780,7 +1049,11 @@ def ai_stock_reasons_batch(contexts, taiex_pct, cfg):
         return {}
     ai_cfg = cfg.get('ai', {})
     model  = ai_cfg.get('model', 'anthropic/claude-haiku-3-5')
-    max_tokens = min(45 * len(contexts) + 120, 2000)
+    # Honour the TUI's per-stock 個股原因 token budget (was hardcoded 45/stock, which
+    # ignored ai.max_tokens_reason). Scales with stock count; capped so a large
+    # watchlist can't run away. Default matches the TUI's displayed default (100).
+    per_stock  = int(ai_cfg.get('max_tokens_reason', 100) or 100)
+    max_tokens = min(per_stock * len(contexts) + 120, 4000)
     rows = []
     for c in contexts:
         direction = '漲' if c.get('change', 0) >= 0 else '跌'
@@ -874,6 +1147,12 @@ def generate_morning_report():
 
     print(f"[{_now()}] [MORNING] Fetching global indices...")
     global_lines = fetch_global_indices(cfg.get('global_indices'))
+
+    # Batch-prefetch daily history for every tracked code up front — quotes,
+    # technicals and 績效 all read from this cache, so the morning report makes a
+    # couple of batched Yahoo calls instead of ~30×3 individual (429-tripping) ones.
+    print(f"[{_now()}] [MORNING] Prefetching stock histories (batched)...")
+    prefetch_stock_histories(list(portfolio) + [c for c in tracked if c not in portfolio])
 
     print(f"[{_now()}] [MORNING] Fetching holdings (yfinance live)...")
     holding_sections = []
@@ -1136,6 +1415,18 @@ def generate_closing_report():
         for s in parse_twse_valid(tpex_stocks):
             if s['Code'] not in twse_by_code:
                 twse_by_code[s['Code']] = s
+
+    # 興櫃 (emerging board) — official TPEX data for codes on neither mainboard feed
+    # (e.g. 3595 山太士, 7924 台灣微脂體). Preferred over Yahoo, shrinks 今日無交易數據.
+    emerging = fetch_tpex_emerging()
+    for code, row in emerging.items():
+        if code not in twse_by_code:
+            twse_by_code[code] = row
+
+    # Batch-prefetch daily history for every tracked code (technicals + 績效 read
+    # from this cache instead of firing ~2 Yahoo calls each → avoids the 429 wall).
+    print(f"[{_now()}] [CLOSING] Prefetching stock histories (batched)...")
+    prefetch_stock_histories(list(portfolio) + [c for c in tracked if c not in portfolio])
 
     print(f"[{_now()}] [CLOSING] Fetching fundamentals (valuation, margin)...")
     _valuation = fetch_valuation()
@@ -1453,9 +1744,8 @@ def _summary_digest(watch_data, holdings_data, scalars, tech_cfg):
             out.append("- " + " ".join(parts))
         return out
 
-    if watch_data:
-        lines.append("觀察清單（當日客觀數據）:")
-        lines.extend(_fmt_rows(watch_data))
+    # Watchlist is intentionally EXCLUDED from the analyst summary (2026-07-08 spec):
+    # the AI analysis covers only the market overview + holding positions.
     if holdings_data:
         lines.append("持倉個股（當日客觀數據）:")
         lines.extend(_fmt_rows(holdings_data))
