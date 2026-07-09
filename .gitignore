@@ -24,3 +24,5 @@ data/
 *.key
 auth-profiles.json
 credentials/
+tracked_stocks.json
+.DS_Store
