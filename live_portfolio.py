@@ -150,14 +150,55 @@ def fetch_history(symbols, period, interval):
 
 
 def fetch_live_quotes(codes, symbol_map):
-    """{code: quote_dict} via the Yahoo v8 chart API (cheap, one call/stock)."""
-    def one(code):
-        return code, get_yfinance_data(symbol_map[code])
+    """{code: {price, prev_close, ...}} for the live board.
+
+    Rebuilt 2026-07-08: derives quotes from BATCHED yf.download instead of firing
+    one raw urllib get_yfinance_data() per stock across 8 threads — that burst of
+    parallel Yahoo v8 chart calls hard-429s (and SSL-failed on the host CA store),
+    which left the live board empty. yf.download uses a browser-impersonating
+    session that isn't throttled (same path the candlestick graphs already use).
+
+    prev_close = prior day's close; price = freshest intraday 1-minute close when
+    available, else the latest daily close. Falls back to the raw per-stock path
+    only for symbols the batch download couldn't resolve.
+    """
+    syms = [symbol_map[c] for c in codes]
+    daily = fetch_history(syms, period='5d', interval='1d')
+    try:
+        intra = fetch_history(syms, period='1d', interval='1m')
+    except Exception:
+        intra = {}
+
     quotes = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        for code, q in ex.map(one, codes):
-            if q:
-                quotes[code] = q
+    missing = []
+    for code in codes:
+        sym = symbol_map[code]
+        d = daily.get(sym)
+        closes = d['Close'].dropna() if d is not None and 'Close' in getattr(d, 'columns', []) else None
+        if closes is None or closes.empty:
+            missing.append(code)
+            continue
+        prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else float(closes.iloc[-1])
+        price = float(closes.iloc[-1])
+        iv = intra.get(sym)
+        if iv is not None and 'Close' in getattr(iv, 'columns', []):
+            ic = iv['Close'].dropna()
+            if not ic.empty:
+                price = float(ic.iloc[-1])   # freshest intraday price during market hours
+        quotes[code] = {
+            'name': code, 'price': price, 'prev_close': prev_close,
+            'today_open': price, 'change': price - prev_close, 'intraday_change': 0.0,
+        }
+
+    # Last-ditch per-stock fallback (hardened get_yfinance_data) for anything the
+    # batch missed — thin/newly-listed symbols yf.download occasionally drops.
+    if missing:
+        def one(code):
+            return code, get_yfinance_data(symbol_map[code])
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            for code, q in ex.map(one, missing):
+                if q:
+                    quotes[code] = q
     return quotes
 
 

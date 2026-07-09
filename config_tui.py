@@ -45,16 +45,31 @@ console = Console()
 SCRIPT_DIR = Path(__file__).parent
 
 def _resolve_data_dir():
-    """Find the persistent config/data directory."""
+    """Find the persistent config/data directory.
+
+    Prefer a dir that actually holds portfolio.json (a real silo). This matters
+    because `_config_path()` in the report falls back to the repo root, which ships
+    tracked_stocks.json but NOT portfolio.json — so a stray launch against an empty
+    dir would silently load the watchlist and drop every holding. Pick the real silo.
+    """
     candidates = []
     env = os.getenv('OPENCLAW_DATA_DIR', '')
     if env:
         candidates.append(Path(env))
     candidates += [
+        # Known silo homes on this machine (live/push silo FIRST) so a bare launch
+        # auto-resolves to real data instead of an empty repo-local dir.
+        Path.home() / 'Agents' / 'openclaw' / 'agents' / 'financial-bot' / 'data',
+        Path.home() / 'Agents' / 'openclaw' / 'openclaw-infra' / 'agents' / 'financial-bot' / 'data',
         SCRIPT_DIR / 'data',
         Path.home() / 'openclaw-infra' / 'agents' / 'financial-bot' / 'data',
         Path('/app/data'),
     ]
+    # 1st choice: an existing dir that actually contains portfolio.json (a real silo)
+    for p in candidates:
+        if p.exists() and p.is_dir() and (p / 'portfolio.json').exists():
+            return p
+    # 2nd: any existing dir (config may live only in the repo-root fallback)
     for p in candidates:
         if p.exists() and p.is_dir():
             return p
@@ -63,6 +78,9 @@ def _resolve_data_dir():
     return first
 
 DATA_DIR  = _resolve_data_dir()
+# True when the resolved data dir has no portfolio.json — holdings would be empty.
+# main_menu() surfaces a loud warning so this can't fail silently (the "watchlist-only" bug).
+DATA_DIR_HAS_PORTFOLIO = (DATA_DIR / 'portfolio.json').exists()
 DOWNLOADS = Path.home() / 'Downloads'
 
 # Dedicated home for brokerage import CSVs — files found elsewhere (e.g. ~/Downloads)
@@ -391,6 +409,13 @@ def main_menu():
         _UNIFORM_WIDTH = _measure(t)
         header('TWSE Daily Report — orchestration')
         console.print(t)
+        console.print(f'[dim]data dir: {DATA_DIR}[/dim]')
+        if not DATA_DIR_HAS_PORTFOLIO:
+            console.print(
+                '[bold red]⚠ No portfolio.json in this data dir — HOLDINGS WILL BE EMPTY '
+                '(watchlist-only reports).[/bold red]\n'
+                '[yellow]  Launch via [bold]~/Agents/agents-ctl tui[/bold] (or set '
+                'OPENCLAW_DATA_DIR to your silo) so the report sees your holdings.[/yellow]')
 
         choice = Prompt.ask('\nSelect', choices=['1','2','3','4','5','6','7','8','q'], default='q')
 
@@ -1142,6 +1167,7 @@ def menu_ai_settings():
         t.add_row('Max tokens — 開盤展望 (outlook)',  str(ai.get('max_tokens_outlook', 200)))
         t.add_row('Max tokens — 收盤研究 (research)', str(ai.get('max_tokens_research', 350)))
         t.add_row('Max tokens — 報告總結 (summary)',  str(ai.get('max_tokens_summary', 400)))
+        t.add_row('個股原因 temperature',              str(ai.get('reason_temperature', '(model default)')))
         t.add_row('Summary model (報告總結)',          ai.get('summary_model') or '(uses Model)')
         t.add_row('Summary key env',                  ai.get('summary_key_env', 'OPENROUTER_API_KEY'))
         t.add_row('Summary temperature',              str(ai.get('summary_temperature', 0.3)))
@@ -1187,6 +1213,17 @@ def menu_ai_settings():
                     ai[key] = int(val)
                 except ValueError:
                     console.print(f'[red]Invalid number for {label}, skipped.[/red]')
+            # 個股原因 temperature — the report reads ai.reason_temperature; expose it here
+            # so it stays TUI-controlled (blank = model default).
+            rt = Prompt.ask('個股原因 temperature (blank = model default)',
+                            default=str(ai.get('reason_temperature', '') or ''))
+            if rt.strip():
+                try:
+                    ai['reason_temperature'] = float(rt)
+                except ValueError:
+                    console.print('[red]Invalid temperature, kept previous.[/red]')
+            else:
+                ai.pop('reason_temperature', None)
             save_bot_config(cfg)
             console.print('[green]✓ Token limits saved.[/green]')
             pause()
