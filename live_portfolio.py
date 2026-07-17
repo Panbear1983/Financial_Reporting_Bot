@@ -255,25 +255,86 @@ def taiwan_market_open(now=None):
 # Rendering
 # ---------------------------------------------------------------------------
 
-def candle_renderable(ohlc_df, title, width, height, hline=None):
-    """plotext candlestick → ANSI → rich Text (embeddable in Live/Group)."""
+def candle_renderable(ohlc_df, title, width, height, hline=None, y_mode='linear'):
+    """plotext chart → ANSI → rich Text (embeddable in Live/Group).
+
+    y_mode: 'linear' → $ candlestick · 'log' → log-$ candlestick (equal % moves =
+    equal height, so fluctuation stays visible on long ranges where the portfolio
+    has grown a lot) · 'pct' → % change from the window's first bar (line)."""
     if ohlc_df is None or ohlc_df.empty:
         return Text('（無資料 / no data at this interval）', style='dim')
     if height < 8 or width < 40:
         return Text('Terminal too small for chart — resize to view.', style='yellow')
 
-    intraday = len(ohlc_df) > 1 and (ohlc_df.index[1] - ohlc_df.index[0]) < pd.Timedelta(days=1)
-    form, fmt = ('d/m H:M', '%d/%m %H:%M') if intraday else ('d/m/Y', '%d/%m/%Y')
+    idx = ohlc_df.index
+    intraday = len(idx) > 1 and (idx[1] - idx[0]) < pd.Timedelta(days=1)
+    span = (idx[-1] - idx[0]) if len(idx) > 1 else pd.Timedelta(0)
+    # Pick the shortest label that stays unambiguous, so the x-axis stays legible:
+    #   single intraday day → time only · multi-day intraday → d/m H:M
+    #   ≤ ~1 year of daily bars → d/m (the year is constant — repeating it is clutter)
+    #   multi-year → m/Y (individual days aren't meaningful at that zoom)
+    if intraday:
+        if span < pd.Timedelta(days=1):
+            form, fmt = ('H:M', '%H:%M')
+        else:
+            form, fmt = ('d/m H:M', '%d/%m %H:%M')
+    elif span > pd.Timedelta(days=400):
+        form, fmt = ('m/Y', '%m/%Y')
+    else:
+        form, fmt = ('d/m', '%d/%m')
 
     plt.clear_figure()
     plt.theme('clear')
     plt.date_form(form)
     plt.plotsize(width, height)
-    dates = [ts.strftime(fmt) for ts in ohlc_df.index]
-    plt.candlestick(dates, {c: ohlc_df[c].tolist() for c in _OHLC})
-    if hline:
-        plt.hline(hline, 'gray')
-    plt.title(title)
+    # plotext re-displays parsed times in the MACHINE's local tz (treating the
+    # naive string as UTC), which shifts intraday labels by the local offset —
+    # e.g. an 09:00 Taipei bar renders as 17:00 on a UTC+8 host. Pre-subtract the
+    # machine offset for time-bearing labels so plotext lands back on the real
+    # session time. Cross-env safe: the offset is 0 in the UTC container.
+    # Skip for date-only (daily/weekly) labels so a bar can't slip across midnight.
+    if intraday:
+        off = datetime.datetime.now().astimezone().utcoffset() or datetime.timedelta(0)
+        dates = [(ts - off).strftime(fmt) for ts in idx]
+    else:
+        dates = [ts.strftime(fmt) for ts in idx]
+    if y_mode == 'pct':
+        base = float(ohlc_df['Close'].iloc[0]) or 1.0
+        plt.plot(dates, [(v / base - 1.0) * 100 for v in ohlc_df['Close'].tolist()])
+        plt.hline(0, 'gray')
+        plt.title(f'{title}  (% from start)')
+    else:
+        plt.candlestick(dates, {c: ohlc_df[c].tolist() for c in _OHLC})
+        # Zoom Y to the actual price band (+ margin) so real fluctuation is
+        # visible. Otherwise a break-even line far below the data (or just a
+        # large absolute base) stretches the axis and flattens the candles into
+        # a sliver at the top. The per-stock charts pass no hline and so already
+        # auto-fit this way — this brings the total chart in line with them.
+        lo = float(ohlc_df['Low'].min())
+        hi = float(ohlc_df['High'].max())
+        pad = (hi - lo) * 0.12 if hi > lo else (abs(hi) * 0.01 or 1.0)
+        ylo, yhi = lo - pad, hi + pad
+        note = ''
+        if hline:
+            if ylo <= hline <= yhi:
+                plt.hline(hline, 'gray')           # break-even in view — show it
+            else:
+                # Off-screen once zoomed: keep the break-even context as a title
+                # note instead of letting the line drag the axis back out.
+                last = float(ohlc_df['Close'].iloc[-1])
+                note = f'  ({(last / hline - 1.0) * 100:+.0f}% vs cost)'
+        if y_mode == 'log':
+            try:
+                plt.yscale('log')
+            except Exception:
+                pass
+            # Don't call plt.ylim() under log scale — this plotext version
+            # power10's the raw bounds and overflows. With the off-range hline
+            # gated out above, plotext already auto-fits log to the data band.
+            plt.title(f'{title}  (log $){note}')
+        else:
+            plt.ylim(ylo, yhi)
+            plt.title(f'{title}{note}')
     return Text.from_ansi(plt.build())
 
 
@@ -294,10 +355,11 @@ def build_live_table(portfolio, quotes):
                     ('Chg%', dict(justify='right')),
                     ('Mkt Value', dict(justify='right')),
                     ('P/L', dict(justify='right')),
-                    ('P/L%', dict(justify='right'))]:
+                    ('P/L%', dict(justify='right')),
+                    ('Daily P/L', dict(justify='right'))]:
         t.add_column(col, **kw)
 
-    tot_val = tot_cost = 0.0
+    tot_val = tot_cost = tot_daily_pnl = 0.0
     for i, (code, pos) in enumerate(portfolio.items(), 1):
         sh, cost = pos.get('shares', 0), pos.get('cost_basis', 0)
         q = quotes.get(code)
@@ -305,23 +367,27 @@ def build_live_table(portfolio, quotes):
         if q:
             price = q['price']
             chg_pct = (price - q['prev_close']) / q['prev_close'] * 100 if q['prev_close'] else 0
+            daily_pnl = (price - q['prev_close']) * sh if q['prev_close'] else 0
             val = price * sh
             pnl = val - cost
             pnl_pct = pnl / cost * 100 if cost else 0
             tot_val += val
+            tot_daily_pnl += daily_pnl
             t.add_row(str(i), code, pos.get('name', ''), f'{sh:,}',
                       f'{price:,.2f}', _fmt_signed(chg_pct, pct=True),
-                      f'{val:,.0f}', _fmt_signed(pnl), _fmt_signed(pnl_pct, pct=True))
+                      f'{val:,.0f}', _fmt_signed(pnl),
+                      _fmt_signed(pnl_pct, pct=True), _fmt_signed(daily_pnl))
         else:
             t.add_row(str(i), code, pos.get('name', ''), f'{sh:,}',
-                      '[dim]…[/dim]', '', '', '', '')
+                      '[dim]…[/dim]', '', '', '', '', '')
 
     if tot_val:
         pnl = tot_val - tot_cost
         t.add_section()
         t.add_row('', '', '[bold]Total[/bold]', '', '',
                   '', f'[bold]{tot_val:,.0f}[/bold]', _fmt_signed(pnl),
-                  _fmt_signed(pnl / tot_cost * 100 if tot_cost else 0, pct=True))
+                  _fmt_signed(pnl / tot_cost * 100 if tot_cost else 0, pct=True),
+                  _fmt_signed(tot_daily_pnl))
     return t
 
 
@@ -527,25 +593,29 @@ def _search_bar(st, search_mode, search_buf, width):
     return bar
 
 
+_YMODE_TAG = {'linear': '$', 'log': 'log$', 'pct': '%ret'}
+
+
 def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
-                 n_pages, total_cost, search_mode, search_buf):
+                 n_pages, total_cost, search_mode, search_buf, y_mode='linear'):
     entry = st['hist'].get(range_key)
     label = RANGES[range_key][0]
     w = console.size.width - 4
     H = console.size.height
     parts = [_hero_line(st, label, page, n_pages)]
+    ykeys = f'\\[l] log \\[%] %ret [dim]({_YMODE_TAG[y_mode]})[/dim]'
 
     if page == 0:
         table = build_live_table(portfolio, st['quotes'])
         chart_h = max(H - len(portfolio) - 16, 8)
         parts.append(candle_renderable(entry['total'], f'Total Portfolio — {label}',
-                                       w, chart_h, hline=total_cost)
+                                       w, chart_h, hline=total_cost, y_mode=y_mode)
                      if entry is not None else Text('fetching…', style='dim'))
         parts.insert(1, table)
         if entry and entry['n_flat']:
             parts.append(Text(f"⚠ {entry['n_flat']} holding(s) shown at last close "
                               f"(no bars at this interval)", style='yellow'))
-        keybar = '[dim]\\[1-7] range  \\[n/p ←/→] page  \\[q] back[/dim]'
+        keybar = f'[dim]\\[1-7] range  \\[n/p ←/→] page  {ykeys}  \\[q] back[/dim]'
     else:
         code = codes[page - 1]
         pos = portfolio[code]
@@ -560,7 +630,7 @@ def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
         sub = entry['stocks'].get(symbol_map[code]) if entry else None
         parts.append(candle_renderable(
             sub[_OHLC] if sub is not None and not sub.empty else None,
-            f'{code} — {label}', w, h_each)
+            f'{code} — {label}', w, h_each, y_mode=y_mode)
             if entry is not None else Text('fetching…', style='dim'))
 
         parts.append(_search_bar(st, search_mode, search_buf, w))
@@ -571,11 +641,11 @@ def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
             if centry and centry['df'] is not None and not centry['df'].empty:
                 title = cmp_['input'] + (f' {cmp_["name"]}' if cmp_.get('name') else '')
                 parts.append(candle_renderable(centry['df'][_OHLC],
-                                               f'{title} — {label}', w, h_each))
+                                               f'{title} — {label}', w, h_each, y_mode=y_mode))
             else:
                 parts.append(Text('fetching…', style='dim'))
-        keybar = ('[dim]\\[1-7] range  \\[n/p ←/→] page  \\[/] compare  '
-                  '\\[c] clear  \\[q] back[/dim]')
+        keybar = ('[dim]\\[1-7] range  \\[n/p] page  \\[/] compare  '
+                  f'{ykeys}  \\[c] clear  \\[q] back[/dim]')
 
     parts.append(Text.from_markup(keybar))
     return Group(*parts)
@@ -598,12 +668,13 @@ def graphs_view(console, portfolio, data_dir):
     page, range_key = 0, '1'
     n_pages = 1 + len(codes)
     search_mode, search_buf = False, ''
+    y_mode = 'linear'   # 'linear' $ · 'log' log-$ · 'pct' % from start
 
     def render():
         st, _ = worker.snapshot()
         return _render_view(console, portfolio, codes, symbol_map, st,
                             range_key, page, n_pages, total_cost,
-                            search_mode, search_buf)
+                            search_mode, search_buf, y_mode)
 
     try:
         with _KeyReader() as keys, Live(render(), console=console,
@@ -636,6 +707,10 @@ def graphs_view(console, portfolio, data_dir):
                         search_mode, search_buf = True, ''
                     elif kl == 'c':
                         worker.clear_compare()
+                    elif kl == 'l':          # toggle linear $ ↔ log $
+                        y_mode = 'linear' if y_mode == 'log' else 'log'
+                    elif k == '%':           # toggle % return ↔ $
+                        y_mode = 'linear' if y_mode == 'pct' else 'pct'
                 live.update(render())
                 threading.Event().wait(0.15)
     except KeyboardInterrupt:
