@@ -1221,8 +1221,6 @@ def generate_morning_report():
             f" [昨收 {prev_cls:,.1f} | {direction}{abs(change):.1f}元 ({pct:+.2f}%)]"
         )
         try:
-            pf_line = format_portfolio_line(c['pos']['shares'], c['pos']['cost_basis'], price)
-            line += '\n' + pf_line
             pf_daily_total += c['pos']['shares'] * change
             pf_gain_total  += c['pos']['shares'] * price - c['pos']['cost_basis']
             pf_cost_total  += c['pos']['cost_basis']
@@ -1494,8 +1492,6 @@ def generate_closing_report():
             f" [成交量: {c['zhang']}張]{_src_tag(row)}"
         )
         try:
-            pf_line = format_portfolio_line(c['pos']['shares'], c['pos']['cost_basis'], row['_close'])
-            line += '\n' + pf_line
             pf_daily_total += c['pos']['shares'] * c['change']
             pf_gain_total  += c['pos']['shares'] * row['_close'] - c['pos']['cost_basis']
             pf_cost_total  += c['pos']['cost_basis']

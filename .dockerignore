@@ -15,3 +15,5 @@ twse_daily_report.md
 src/
 .conda/
 scripts/git-hooks/
+deploy.sh
+deploy/

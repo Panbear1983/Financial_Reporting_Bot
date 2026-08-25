@@ -47,8 +47,14 @@ RANGES = {
     '7': ('5Y',    '5y',  '1wk', 3600),
 }
 
-QUOTE_TTL_OPEN   = 150   # table refresh cadence during market hours
+# The live board's heartbeat. Affordable only because the quote path is ONE
+# batched request for the whole book (see fetch_quote_batch) — yf.download costs
+# one HTTP call per ticker, so a 15-holding portfolio on this cadence would be
+# 45 req/min and straight into the 429s that used to blank the board.
+QUOTE_TTL_OPEN   = 20    # live board cadence during market hours
 QUOTE_TTL_CLOSED = 600
+
+_QUOTE_URL = 'https://query1.finance.yahoo.com/v7/finance/quote'
 
 _OHLC = ['Open', 'High', 'Low', 'Close']
 
@@ -149,55 +155,119 @@ def fetch_history(symbols, period, interval):
     return out
 
 
-def fetch_live_quotes(codes, symbol_map):
-    """{code: {price, prev_close, ...}} for the live board.
+def _quote_time(epoch):
+    """Yahoo's regularMarketTime (unix secs) → local-tz datetime, or None."""
+    try:
+        return (datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc)
+                .astimezone())
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
 
-    Rebuilt 2026-07-08: derives quotes from BATCHED yf.download instead of firing
-    one raw urllib get_yfinance_data() per stock across 8 threads — that burst of
-    parallel Yahoo v8 chart calls hard-429s (and SSL-failed on the host CA store),
-    which left the live board empty. yf.download uses a browser-impersonating
-    session that isn't throttled (same path the candlestick graphs already use).
 
-    prev_close = prior day's close; price = freshest intraday 1-minute close when
-    available, else the latest daily close. Falls back to the raw per-stock path
-    only for symbols the batch download couldn't resolve.
+def fetch_quote_batch(symbols):
+    """{symbol: raw Yahoo quote} for every symbol in ONE authenticated request.
+
+    yf.download — the path the live board used to take — issues one HTTP call per
+    ticker, so quote cadence scaled with portfolio size and any refresh fast enough
+    to look live risked the 429s that once blanked the board. This endpoint returns
+    the whole book in a single call, so the cadence is independent of how many
+    holdings there are.
+
+    It also carries the authoritative regularMarketPreviousClose. Deriving that
+    from a 5d daily frame's second-to-last ROW silently picked the wrong DAY
+    whenever Yahoo's frame had a hole (0050/006208 were missing 2026-08-12), which
+    quietly corrupted Chg% and Daily P/L. Returns {} on any failure — callers fall
+    back to the frame path.
+    """
+    try:
+        import yfinance.data as yfd
+        r = yfd.YfData().get_raw_json(_QUOTE_URL, params={'symbols': ','.join(symbols)})
+        return {q['symbol']: q for q in r.get('quoteResponse', {}).get('result', [])
+                if q.get('symbol')}
+    except Exception:
+        return {}
+
+
+def fetch_live_quotes(codes, symbol_map, daily=None):
+    """{code: {price, prev_close, intraday, quote_at, ...}} for the live board.
+
+    Primary path is one batched quote call (fetch_quote_batch). Anything it
+    doesn't cover falls back to per-symbol OHLC frames — prev_close from the daily
+    frame, price from the freshest 1-minute bar when one exists, else the daily
+    close. `daily` lets a caller inject that frame instead of fetching it.
+
+    quote['intraday'] records whether the price can still move this session: a
+    batched market quote can, a price that fell back to the daily close cannot,
+    and the board marks the latter rather than letting it read as a flat market.
+    quote['quote_at'] is the exchange-side timestamp (datetime, when Yahoo gives
+    one) — the honest answer to "how live is this number", since the TW feed is
+    delayed and repainting the screen doesn't make a price newer.
     """
     syms = [symbol_map[c] for c in codes]
-    daily = fetch_history(syms, period='5d', interval='1d')
-    try:
-        intra = fetch_history(syms, period='1d', interval='1m')
-    except Exception:
-        intra = {}
+    batch = fetch_quote_batch(syms)
 
-    quotes = {}
-    missing = []
+    quotes, missing = {}, []
     for code in codes:
-        sym = symbol_map[code]
-        d = daily.get(sym)
-        closes = d['Close'].dropna() if d is not None and 'Close' in getattr(d, 'columns', []) else None
-        if closes is None or closes.empty:
+        b = batch.get(symbol_map[code]) or {}
+        price, prev_close = b.get('regularMarketPrice'), b.get('regularMarketPreviousClose')
+        if price is None or prev_close is None:
             missing.append(code)
             continue
-        prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else float(closes.iloc[-1])
-        price = float(closes.iloc[-1])
-        iv = intra.get(sym)
-        if iv is not None and 'Close' in getattr(iv, 'columns', []):
-            ic = iv['Close'].dropna()
-            if not ic.empty:
-                price = float(ic.iloc[-1])   # freshest intraday price during market hours
+        price, prev_close = float(price), float(prev_close)
+        qt = b.get('regularMarketTime')
         quotes[code] = {
-            'name': code, 'price': price, 'prev_close': prev_close,
-            'today_open': price, 'change': price - prev_close, 'intraday_change': 0.0,
+            'name': b.get('shortName') or code, 'price': price, 'prev_close': prev_close,
+            'intraday': True, 'quote_at': _quote_time(qt),
+            'today_open': float(b.get('regularMarketOpen') or price),
+            'change': price - prev_close, 'intraday_change': 0.0,
         }
 
-    # Last-ditch per-stock fallback (hardened get_yfinance_data) for anything the
-    # batch missed — thin/newly-listed symbols yf.download occasionally drops.
+    # Frame fallback, for the missing symbols only — usually nobody.
+    if missing:
+        msyms = [symbol_map[c] for c in missing]
+        if daily is None:
+            daily = fetch_history(msyms, period='5d', interval='1d')
+        try:
+            intra = fetch_history(msyms, period='1d', interval='1m')
+        except Exception:
+            intra = {}
+        still_missing = []
+        for code in missing:
+            sym = symbol_map[code]
+            d = daily.get(sym)
+            closes = (d['Close'].dropna()
+                      if d is not None and 'Close' in getattr(d, 'columns', []) else None)
+            if closes is None or closes.empty:
+                still_missing.append(code)
+                continue
+            prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else float(closes.iloc[-1])
+            price = float(closes.iloc[-1])
+            live = False
+            iv = intra.get(sym)
+            if iv is not None and 'Close' in getattr(iv, 'columns', []):
+                ic = iv['Close'].dropna()
+                if not ic.empty:
+                    price = float(ic.iloc[-1])   # freshest intraday price this session
+                    live = True
+            quotes[code] = {
+                'name': code, 'price': price, 'prev_close': prev_close, 'intraday': live,
+                'quote_at': None, 'today_open': price,
+                'change': price - prev_close, 'intraday_change': 0.0,
+            }
+        missing = still_missing
+
+    # Last-ditch per-stock fallback (hardened get_yfinance_data) for anything
+    # neither the batch quote nor the OHLC frames could resolve — thin or
+    # newly-listed symbols that Yahoo's bulk endpoints occasionally drop.
     if missing:
         def one(code):
             return code, get_yfinance_data(symbol_map[code])
         with ThreadPoolExecutor(max_workers=4) as ex:
             for code, q in ex.map(one, missing):
                 if q:
+                    # regularMarketPrice off the chart endpoint is a live quote,
+                    # so this path is never the frozen-at-last-close case.
+                    q.setdefault('intraday', True)
                     quotes[code] = q
     return quotes
 
@@ -345,7 +415,15 @@ def _fmt_signed(v, pct=False):
     return f'[{color}]{s}[/{color}]'
 
 
-def build_live_table(portfolio, quotes):
+def build_live_table(portfolio, quotes, market_open=None):
+    """Returns (table, n_unpriced, frozen_codes).
+
+    n_unpriced / frozen_codes are the two ways the board can lie about being
+    live, handed back so the caller can annotate them: holdings with no quote at
+    all (excluded from the totals entirely) and holdings priced off the daily
+    close because no 1-minute bar exists (shown, but unable to tick)."""
+    if market_open is None:
+        market_open = taiwan_market_open()
     t = Table(title='Portfolio Holdings — Live', box=box.ROUNDED)
     for col, kw in [('#', dict(style='dim', width=3, justify='right')),
                     ('Code', dict(style='bold cyan', width=8)),
@@ -360,10 +438,10 @@ def build_live_table(portfolio, quotes):
         t.add_column(col, **kw)
 
     tot_val = tot_cost = tot_daily_pnl = 0.0
+    n_unpriced, frozen = 0, []
     for i, (code, pos) in enumerate(portfolio.items(), 1):
         sh, cost = pos.get('shares', 0), pos.get('cost_basis', 0)
         q = quotes.get(code)
-        tot_cost += cost
         if q:
             price = q['price']
             chg_pct = (price - q['prev_close']) / q['prev_close'] * 100 if q['prev_close'] else 0
@@ -372,23 +450,36 @@ def build_live_table(portfolio, quotes):
             pnl = val - cost
             pnl_pct = pnl / cost * 100 if cost else 0
             tot_val += val
+            # Cost joins the total only alongside its own market value. Adding it
+            # unconditionally booked an unpriced holding's entire position as a
+            # loss, so one failed quote could sink the whole portfolio's P/L.
+            tot_cost += cost
             tot_daily_pnl += daily_pnl
+            px = f'{price:,.2f}'
+            if market_open and not q.get('intraday', True):
+                px = f'[dim]{px}[/dim]'      # can't tick — see the note under the table
+                frozen.append(code)
             t.add_row(str(i), code, pos.get('name', ''), f'{sh:,}',
-                      f'{price:,.2f}', _fmt_signed(chg_pct, pct=True),
+                      px, _fmt_signed(chg_pct, pct=True),
                       f'{val:,.0f}', _fmt_signed(pnl),
                       _fmt_signed(pnl_pct, pct=True), _fmt_signed(daily_pnl))
         else:
+            n_unpriced += 1
             t.add_row(str(i), code, pos.get('name', ''), f'{sh:,}',
                       '[dim]…[/dim]', '', '', '', '', '')
 
     if tot_val:
         pnl = tot_val - tot_cost
+        # Say so when the Total covers only part of the book, so a shrunken
+        # figure is never mistaken for the market moving.
+        label = ('Total' if not n_unpriced
+                 else f'Total ({len(portfolio) - n_unpriced}/{len(portfolio)})')
         t.add_section()
-        t.add_row('', '', '[bold]Total[/bold]', '', '',
+        t.add_row('', '', f'[bold]{label}[/bold]', '', '',
                   '', f'[bold]{tot_val:,.0f}[/bold]', _fmt_signed(pnl),
                   _fmt_signed(pnl / tot_cost * 100 if tot_cost else 0, pct=True),
                   _fmt_signed(tot_daily_pnl))
-    return t
+    return t, n_unpriced, frozen
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +538,7 @@ class _Worker(threading.Thread):
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.range_key = '1'                 # currently displayed range
-        self.state = {'quotes': {}, 'quotes_at': None,
+        self.state = {'quotes': {}, 'quotes_at': None, 'quotes_try_at': None,
                       'hist': {}, 'compare': None, 'error': '', 'backoff': 1}
 
     def set_range(self, key):
@@ -488,13 +579,22 @@ class _Worker(threading.Thread):
         backoff = st['backoff']
         quote_ttl = (QUOTE_TTL_OPEN if taiwan_market_open() else QUOTE_TTL_CLOSED) * backoff
 
-        if self._stale(st['quotes_at'], quote_ttl):
+        # Pace off the last ATTEMPT, not the last success. Yahoo returns empty
+        # rather than raising when it throttles, so gating on quotes_at meant a
+        # failed fetch stayed stale and the 2s worker loop retried immediately —
+        # a hot retry storm that guaranteed more throttling while the board sat
+        # frozen with nothing on screen saying so.
+        if self._stale(st['quotes_try_at'], quote_ttl):
+            with self.lock:
+                self.state['quotes_try_at'] = datetime.datetime.now()
             quotes = fetch_live_quotes(list(self.portfolio), self.symbol_map)
             with self.lock:
                 if quotes:
                     self.state['quotes'] = quotes
                     self.state['quotes_at'] = datetime.datetime.now()
                     self.state['error'] = ''
+                else:
+                    self.state['error'] = 'quote fetch returned nothing (throttled?)'
 
         _, period, interval, ttl = RANGES[rkey]
         entry = st['hist'].get(rkey)
@@ -557,8 +657,20 @@ class _Worker(threading.Thread):
 def _hero_line(st, label, page, n_pages):
     """Status line shown at the very top of every page."""
     mkt = '[red]OPEN[/red]' if taiwan_market_open() else '[dim]CLOSED — showing last session[/dim]'
-    at = st['quotes_at'].strftime('%H:%M:%S') if st['quotes_at'] else '—'
-    s = f'market {mkt} · updated {at} · range [bold]{label}[/bold] · page {page+1}/{n_pages}'
+    if st['quotes_at']:
+        # Age, not just a timestamp: the screen repaints 4×/s off cached quotes,
+        # so this is the only thing that says whether the numbers are live.
+        age = int((datetime.datetime.now() - st['quotes_at']).total_seconds())
+        at = st['quotes_at'].strftime('%H:%M:%S') + f' [dim]({age}s ago)[/dim]'
+    else:
+        at = '—'
+    # When we polled ≠ when the exchange last printed. The TW feed is delayed, so
+    # show Yahoo's own quote stamp too — otherwise a fresh poll of a stale price
+    # looks like a live market that isn't moving.
+    stamps = {q['quote_at'] for q in st.get('quotes', {}).values() if q.get('quote_at')}
+    quoted = f' · quote {max(stamps).strftime("%H:%M:%S")}' if stamps else ''
+    s = (f'market {mkt} · updated {at}{quoted} · range [bold]{label}[/bold] · '
+         f'page {page+1}/{n_pages}')
     if st['error']:
         s += f' · [yellow]stale — {st["error"]}[/yellow]'
     return Text.from_markup(s)
@@ -606,15 +718,28 @@ def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
     ykeys = f'\\[l] log \\[%] %ret [dim]({_YMODE_TAG[y_mode]})[/dim]'
 
     if page == 0:
-        table = build_live_table(portfolio, st['quotes'])
-        chart_h = max(H - len(portfolio) - 16, 8)
+        table, n_unpriced, frozen = build_live_table(portfolio, st['quotes'])
+        notes = []
+        # Only after a fetch has actually landed — before that every holding is
+        # "unpriced" simply because the first cycle hasn't returned yet, and the
+        # warning would fire on every startup.
+        if n_unpriced and st['quotes_at']:
+            notes.append(f'⚠ {n_unpriced} holding(s) have no quote — left out of Total '
+                         f'(both value and cost)')
+        if frozen:
+            notes.append(f'⚠ no intraday feed for {", ".join(frozen)} — priced at last '
+                         f'close, will not move until the next session')
+        if entry and entry['n_flat']:
+            notes.append(f"⚠ {entry['n_flat']} holding(s) shown at last close "
+                         f"(no bars at this interval)")
+        # Reserve a row per note so the chart shrinks instead of scrolling them off.
+        chart_h = max(H - len(portfolio) - 16 - len(notes), 8)
         parts.append(candle_renderable(entry['total'], f'Total Portfolio — {label}',
                                        w, chart_h, hline=total_cost, y_mode=y_mode)
                      if entry is not None else Text('fetching…', style='dim'))
         parts.insert(1, table)
-        if entry and entry['n_flat']:
-            parts.append(Text(f"⚠ {entry['n_flat']} holding(s) shown at last close "
-                              f"(no bars at this interval)", style='yellow'))
+        for note in notes:
+            parts.append(Text(note, style='yellow'))
         keybar = f'[dim]\\[1-7] range  \\[n/p ←/→] page  {ykeys}  \\[q] back[/dim]'
     else:
         code = codes[page - 1]
@@ -623,6 +748,8 @@ def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
         head = f"{code} {pos.get('name','')} — {pos.get('shares',0):,} shares"
         if q:
             head += f" · last {q['price']:,.2f}"
+            if taiwan_market_open() and not q.get('intraday', True):
+                head += ' (last close — no intraday feed)'
         parts.append(Text(head, style='bold cyan'))
 
         # Top half: the holding's graph; bottom half: the compared ticker's.
