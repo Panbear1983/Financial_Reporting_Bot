@@ -7,7 +7,8 @@ Interactive terminal UI scoped to the single TWSE daily-report cron routine
 structure, timing, AI, or delivery.
 
 Panels: Portfolio (+CSV import) · Watchlist · Report Schedule · Layout & Content ·
-        AI & Indicators · Preview & Send · Delivery & Keys
+        AI & Indicators · Preview & Send · Delivery & Keys · Market Diary ·
+        Daemon Control (Docker scheduler: status/logs/go-live/stop)
 
 Run:
     python3 config_tui.py
@@ -45,16 +46,31 @@ console = Console()
 SCRIPT_DIR = Path(__file__).parent
 
 def _resolve_data_dir():
-    """Find the persistent config/data directory."""
+    """Find the persistent config/data directory.
+
+    Prefer a dir that actually holds portfolio.json (a real silo). This matters
+    because `_config_path()` in the report falls back to the repo root, which ships
+    tracked_stocks.json but NOT portfolio.json — so a stray launch against an empty
+    dir would silently load the watchlist and drop every holding. Pick the real silo.
+    """
     candidates = []
     env = os.getenv('OPENCLAW_DATA_DIR', '')
     if env:
         candidates.append(Path(env))
     candidates += [
+        # Known silo homes on this machine (live/push silo FIRST) so a bare launch
+        # auto-resolves to real data instead of an empty repo-local dir.
+        Path.home() / 'Agents' / 'openclaw' / 'agents' / 'financial-bot' / 'data',
+        Path.home() / 'Agents' / 'openclaw' / 'openclaw-infra' / 'agents' / 'financial-bot' / 'data',
         SCRIPT_DIR / 'data',
         Path.home() / 'openclaw-infra' / 'agents' / 'financial-bot' / 'data',
         Path('/app/data'),
     ]
+    # 1st choice: an existing dir that actually contains portfolio.json (a real silo)
+    for p in candidates:
+        if p.exists() and p.is_dir() and (p / 'portfolio.json').exists():
+            return p
+    # 2nd: any existing dir (config may live only in the repo-root fallback)
     for p in candidates:
         if p.exists() and p.is_dir():
             return p
@@ -63,6 +79,9 @@ def _resolve_data_dir():
     return first
 
 DATA_DIR  = _resolve_data_dir()
+# True when the resolved data dir has no portfolio.json — holdings would be empty.
+# main_menu() surfaces a loud warning so this can't fail silently (the "watchlist-only" bug).
+DATA_DIR_HAS_PORTFOLIO = (DATA_DIR / 'portfolio.json').exists()
 DOWNLOADS = Path.home() / 'Downloads'
 
 # Dedicated home for brokerage import CSVs — files found elsewhere (e.g. ~/Downloads)
@@ -384,6 +403,8 @@ def main_menu():
                   f'Telegram · OpenRouter · Brave ({ENV_PATH.name})')
         t.add_row('[8]', 'Market Diary',
                   'browse archived reports · year/month/date')
+        t.add_row('[9]', 'Daemon Control',
+                  'Docker scheduler · status · logs · ⚠ go-live/stop')
         t.add_row('[q]', 'Quit', '')
         # Anchor the app-wide uniform title-box width to this (widest) home table,
         # so every page that follows draws an identically sized box.
@@ -391,8 +412,15 @@ def main_menu():
         _UNIFORM_WIDTH = _measure(t)
         header('TWSE Daily Report — orchestration')
         console.print(t)
+        console.print(f'[dim]data dir: {DATA_DIR}[/dim]')
+        if not DATA_DIR_HAS_PORTFOLIO:
+            console.print(
+                '[bold red]⚠ No portfolio.json in this data dir — HOLDINGS WILL BE EMPTY '
+                '(watchlist-only reports).[/bold red]\n'
+                '[yellow]  Launch via [bold]~/Agents/agents-ctl tui[/bold] (or set '
+                'OPENCLAW_DATA_DIR to your silo) so the report sees your holdings.[/yellow]')
 
-        choice = Prompt.ask('\nSelect', choices=['1','2','3','4','5','6','7','8','q'], default='q')
+        choice = Prompt.ask('\nSelect', choices=['1','2','3','4','5','6','7','8','9','q'], default='q')
 
         if   choice == '1': menu_portfolio()
         elif choice == '2': menu_watchlist()
@@ -402,6 +430,7 @@ def main_menu():
         elif choice == '6': menu_sandbox()
         elif choice == '7': menu_api_keys()
         elif choice == '8': menu_diary()
+        elif choice == '9': menu_daemon()
         else:
             console.print('\n[dim]Goodbye.[/dim]\n')
             break
@@ -1142,6 +1171,7 @@ def menu_ai_settings():
         t.add_row('Max tokens — 開盤展望 (outlook)',  str(ai.get('max_tokens_outlook', 200)))
         t.add_row('Max tokens — 收盤研究 (research)', str(ai.get('max_tokens_research', 350)))
         t.add_row('Max tokens — 報告總結 (summary)',  str(ai.get('max_tokens_summary', 400)))
+        t.add_row('個股原因 temperature',              str(ai.get('reason_temperature', '(model default)')))
         t.add_row('Summary model (報告總結)',          ai.get('summary_model') or '(uses Model)')
         t.add_row('Summary key env',                  ai.get('summary_key_env', 'OPENROUTER_API_KEY'))
         t.add_row('Summary temperature',              str(ai.get('summary_temperature', 0.3)))
@@ -1187,6 +1217,17 @@ def menu_ai_settings():
                     ai[key] = int(val)
                 except ValueError:
                     console.print(f'[red]Invalid number for {label}, skipped.[/red]')
+            # 個股原因 temperature — the report reads ai.reason_temperature; expose it here
+            # so it stays TUI-controlled (blank = model default).
+            rt = Prompt.ask('個股原因 temperature (blank = model default)',
+                            default=str(ai.get('reason_temperature', '') or ''))
+            if rt.strip():
+                try:
+                    ai['reason_temperature'] = float(rt)
+                except ValueError:
+                    console.print('[red]Invalid temperature, kept previous.[/red]')
+            else:
+                ai.pop('reason_temperature', None)
             save_bot_config(cfg)
             console.print('[green]✓ Token limits saved.[/green]')
             pause()
@@ -1669,6 +1710,124 @@ def _menu_global_indices(cfg):
             pause()
         else:
             break
+
+
+# ---------------------------------------------------------------------------
+# [9] Daemon Control — the Docker scheduler container that actually pushes.
+# The TUI must drive AND reflect the real running mechanism; before this panel
+# it could only edit config and fire one-shot runs, blind to the daemon.
+# ---------------------------------------------------------------------------
+
+DAEMON_CONTAINER = 'openclaw-financial-bot'
+DAEMON_AGENT_ID  = 'financial-bot'
+
+
+def _find_oc_manage():
+    """Locate the oc-manage lifecycle wrapper (env override, then known home)."""
+    candidates = []
+    env = os.getenv('OC_MANAGE', '')
+    if env:
+        candidates.append(Path(env))
+    candidates.append(Path.home() / 'Agents' / 'openclaw' / 'openclaw-infra' / 'oc-manage')
+    for p in candidates:
+        if p.is_file() and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _docker_query(*args, timeout=5):
+    """Read-only docker query. Returns stdout ('' = no match) or None when
+    docker is missing/unreachable — callers must distinguish the two."""
+    if not shutil.which('docker'):
+        return None
+    try:
+        r = subprocess.run(['docker', *args], capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _daemon_status_markup():
+    out = _docker_query('ps', '--filter', f'name=^{DAEMON_CONTAINER}$', '--format', '{{.Status}}')
+    if out is None:
+        return '[yellow]docker unavailable (Docker Desktop not running?)[/yellow]'
+    if out:
+        return f'[bold green]RUNNING[/bold green] [green]· {out} · armed schedule, pushes to Telegram[/green]'
+    return '[bold red]NOT RUNNING[/bold red] [dim]· no scheduled reports will push[/dim]'
+
+
+def _run_lifecycle(cmd, env=None):
+    """Stream a lifecycle command (deploy/build/prune/logs) to the terminal."""
+    console.print(Rule(style='dim'))
+    try:
+        subprocess.run([str(a) for a in cmd], env=env)
+    except KeyboardInterrupt:
+        console.print('\n[yellow]Stopped.[/yellow]')
+    console.print(Rule(style='dim'))
+    pause()
+
+
+def menu_daemon():
+    oc_manage = _find_oc_manage()
+    # Compose builds from ${BOT_REPO}; pin it to the repo this TUI runs from so
+    # deploy/build can never silently compile a different (stale) clone.
+    lifecycle_env = {**os.environ, 'BOT_REPO': str(SCRIPT_DIR)}
+
+    while True:
+        header('Daemon Control — Docker scheduler (the mechanism that pushes)')
+
+        image = _docker_query('images', 'openclaw-hardened:latest',
+                              '--format', '{{.Repository}}:{{.Tag}} · {{.Size}} · built {{.CreatedSince}}')
+        t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        t.add_column(style='bold', width=10)
+        t.add_column()
+        t.add_row('container', _daemon_status_markup())
+        t.add_row('image', image if image else '[dim]openclaw-hardened:latest not built[/dim]')
+        t.add_row('manager', str(oc_manage) if oc_manage
+                  else '[yellow]oc-manage not found — lifecycle actions disabled[/yellow]')
+        t.add_row('build ctx', str(SCRIPT_DIR))
+        console.print(t)
+        console.print()
+
+        console.print('[cyan][1][/cyan] Refresh status')
+        console.print('[cyan][2][/cyan] Follow container logs (Ctrl+C to return)')
+        console.print('[cyan][3][/cyan] Resource stats (one-shot)')
+        console.print('[cyan][4][/cyan] Build image (no run)')
+        console.print('[red][5][/red] GO-LIVE deploy (armed schedule — WILL push to Telegram)')
+        console.print('[red][6][/red] Stop & remove container (halts scheduled reports)')
+        console.print('[cyan][b][/cyan] Back\n')
+
+        choice = Prompt.ask('Select', choices=['1', '2', '3', '4', '5', '6', 'b'], default='1')
+
+        if choice == 'b':
+            return
+        if choice == '1':
+            continue
+        if choice == '2':
+            console.print(f'\n[dim]docker logs -f --tail 100 {DAEMON_CONTAINER} … Ctrl+C to return[/dim]')
+            _run_lifecycle(['docker', 'logs', '-f', '--tail', '100', DAEMON_CONTAINER])
+        elif choice == '3':
+            _run_lifecycle(['docker', 'stats', '--no-stream'])
+        elif choice in ('4', '5', '6'):
+            if not oc_manage:
+                console.print('[red]oc-manage not found — cannot run lifecycle actions from here.[/red]')
+                pause(); continue
+            if choice == '4':
+                _run_lifecycle([oc_manage, 'build', DAEMON_AGENT_ID], env=lifecycle_env)
+            elif choice == '5':
+                console.print('\n[bold red]⚠ GO-LIVE: builds + starts the container with an ARMED '
+                              'schedule. Reports WILL push to real Telegram.[/bold red]')
+                if Confirm.ask('Confirm GO-LIVE deploy?', default=False):
+                    _run_lifecycle([oc_manage, 'deploy', DAEMON_AGENT_ID], env=lifecycle_env)
+                else:
+                    console.print('[dim]Cancelled.[/dim]'); pause()
+            else:
+                console.print('\n[bold red]⚠ This stops the daemon — no scheduled reports until '
+                              'the next GO-LIVE deploy.[/bold red]')
+                if Confirm.ask('Confirm stop & remove?', default=False):
+                    _run_lifecycle([oc_manage, 'prune', DAEMON_AGENT_ID], env=lifecycle_env)
+                else:
+                    console.print('[dim]Cancelled.[/dim]'); pause()
 
 
 # ---------------------------------------------------------------------------
