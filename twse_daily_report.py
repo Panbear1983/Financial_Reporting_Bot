@@ -650,28 +650,132 @@ def fetch_yfinance_stock(code):
     return None
 
 
+def _roc_date(yyyymmdd):
+    """'20260904' -> '1150904' (ROC year = Gregorian - 1911), matching STOCK_DAY_ALL."""
+    try:
+        return f"{int(yyyymmdd[:4]) - 1911}{yyyymmdd[4:8]}"
+    except (TypeError, ValueError, IndexError):
+        return ''
+
+
+def fetch_twse_mi_index(date_yyyymmdd):
+    """Whole-market 每日收盤行情 from MI_INDEX, shaped like a STOCK_DAY_ALL row.
+
+    MI_INDEX (www.twse.com.tw) carries the *current* session within ~1h of the
+    13:30 close. The openapi STOCK_DAY_ALL mirror lags a full day — at 16:30 on
+    2026-09-04 it was still serving 1150903 — which silently turned every closing
+    report into the previous session's prices (and its 今日損益). This is the
+    primary source; STOCK_DAY_ALL is now only the fallback.
+
+    Returns [] on any failure (non-trading day, not yet published, network).
+    """
+    try:
+        r = requests.get(
+            'https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX',
+            params={'date': date_yyyymmdd, 'type': 'ALLBUT0999', 'response': 'json'},
+            headers={'User-Agent': 'Mozilla/5.0'}, timeout=20, verify=False,
+        )
+        payload = r.json()
+    except Exception as e:
+        print(f"[{_now()}] MI_INDEX fetch failed: {e}")
+        return []
+
+    if str(payload.get('stat', '')).upper() != 'OK':
+        print(f"[{_now()}] MI_INDEX {date_yyyymmdd}: {payload.get('stat')}")
+        return []
+
+    # The per-stock table is the one whose fields start with 證券代號; its index
+    # shifts as TWSE adds/removes index tables, so find it rather than hard-code 8.
+    table = next((t for t in payload.get('tables', [])
+                  if (t.get('fields') or [None])[0] == '證券代號'), None)
+    if not table:
+        print(f"[{_now()}] MI_INDEX {date_yyyymmdd}: 每日收盤行情 table absent")
+        return []
+
+    roc = _roc_date(str(payload.get('date') or date_yyyymmdd))
+
+    def _num(v):
+        return str(v or '').replace(',', '').strip()
+
+    out = []
+    for row in table.get('data', []):
+        try:
+            close = _num(row[8])
+            if not close or close == '--':      # no trades today — nothing to report
+                continue
+            # 漲跌(+/-) arrives as an HTML span: <p style= color:red>+</p>.
+            sign = re.sub(r'<[^>]*>', '', str(row[9])).strip()
+            mag  = float(_num(row[10]) or '0')
+            change = -mag if sign == '-' else mag
+            out.append({
+                'Date':         roc,
+                'Code':         str(row[0]).strip(),
+                'Name':         str(row[1]).strip(),
+                'TradeVolume':  _num(row[2]),
+                'Transaction':  _num(row[3]),
+                'TradeValue':   _num(row[4]),
+                'OpeningPrice': _num(row[5]),
+                'HighestPrice': _num(row[6]),
+                'LowestPrice':  _num(row[7]),
+                'ClosingPrice': close,
+                'Change':       f"{change:.4f}",
+            })
+        except (IndexError, ValueError, TypeError):
+            continue
+    return out
+
+
 def fetch_twse_all():
-    """Full TWSE scan. Returns list of stock dicts or None."""
+    """Full TWSE scan. Returns list of stock dicts or None.
+
+    MI_INDEX first (has today's close); STOCK_DAY_ALL only as fallback because
+    that mirror can still be serving the previous session hours after the close.
+    """
+    today = datetime.datetime.now().strftime('%Y%m%d')
+    rows = fetch_twse_mi_index(today)
+    if rows:
+        print(f"[{_now()}] TWSE data date: {rows[0]['Date']} ({len(rows)} stocks) [MI_INDEX]")
+        return rows
+
     try:
         result = TWSDDataSource().fetch_data()
         data   = result['data']
         date   = data[0].get('Date', '') if data else ''
-        print(f"[{_now()}] TWSE data date: {date} ({len(data)} stocks)")
+        print(f"[{_now()}] TWSE data date: {date} ({len(data)} stocks) [STOCK_DAY_ALL fallback]")
         return data
     except Exception as e:
         print(f"[{_now()}] TWSE fetch failed: {e}")
         return None
 
 
+def _get_json_retry(url, attempts=4, timeout=30, **kw):
+    """GET → parsed JSON, retrying transient failures with a short backoff.
+
+    The TPEX openapi host drops a connection mid-body ("Response ended
+    prematurely") on roughly 1 call in 4. A single-shot fetch made every 上櫃
+    holding silently degrade to a Yahoo quote tagged 「yfinance 報價」 with
+    成交量 0, on a random subset of days. Raises the last error if all fail.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'},
+                             timeout=timeout, **kw)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            if i < attempts - 1:
+                print(f"[{_now()}] retry {i + 1}/{attempts - 1} ({url.rsplit('/', 1)[-1]}): {e}")
+                time.sleep(1.5 * (i + 1))
+    raise last
+
+
 def fetch_tpex_all():
     """TPEX (上櫃) daily data, normalized to match TWSE field names."""
     try:
-        resp = requests.get(
-            'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes',
-            headers={'User-Agent': 'Mozilla/5.0'},
-            timeout=15,
-        )
-        raw = resp.json()
+        raw = _get_json_retry(
+            'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes')
         normalized = [{
             'Code':         s.get('SecuritiesCompanyCode', ''),
             'Name':         s.get('CompanyName', ''),
@@ -705,9 +809,8 @@ def fetch_tpex_emerging():
             return None
     out = {}
     try:
-        r = requests.get('https://www.tpex.org.tw/openapi/v1/tpex_esb_latest_statistics',
-                         headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
-        for s in r.json():
+        for s in _get_json_retry(
+                'https://www.tpex.org.tw/openapi/v1/tpex_esb_latest_statistics'):
             code = (s.get('SecuritiesCompanyCode') or '').strip()
             avg  = _f(s.get('Average'))
             if not code or avg is None or avg <= 0:
@@ -887,6 +990,18 @@ def _twse_row_from_yfinance(code):
         '_vol': 0,
         '_fallback': 'yfinance',   # source marker (yfinance, not TWSE official)
     }
+
+
+def _chg_text(close, change):
+    """'昨收 335.00，漲 10.0元 / +2.99%' — the day change is measured against the
+    PREVIOUS CLOSE, not the open, so the reference has to be on the line. Without it
+    a row like 開盤 543 → 收盤 538 (漲 11.0元) reads as self-contradictory.
+    Sub-dollar moves keep 2dp so a 0.02元 ETF tick isn't printed as 0.0元."""
+    prev = close - change
+    pct  = (change / prev * 100) if prev else 0.0
+    dp   = 1 if abs(change) >= 1 else 2
+    return (f"昨收 {prev:,.2f}，{'漲' if change >= 0 else '跌'} "
+            f"{abs(change):,.{dp}f}元 / {pct:+.2f}%")
 
 
 def _src_tag(row):
@@ -1399,6 +1514,12 @@ def generate_closing_report():
     twse_date_raw = all_stocks[0].get('Date', '') if all_stocks else ''
     today_roc = datetime.datetime.now().strftime(f"{datetime.datetime.now().year - 1911}%m%d")
     data_is_stale = twse_date_raw != today_roc
+    if data_is_stale:
+        # Never price a holding off a previous session — 今日損益 would be that day's
+        # P&L reported as today's. Fall through to live per-code quotes instead; the
+        # whole-market hotlist is the only thing that still has to use the old rows.
+        print(f"[{_now()}] [CLOSING] TWSE feed is {twse_date_raw}, not {today_roc} — "
+              f"per-stock lines fall back to live quotes")
 
     valid = parse_twse_valid(all_stocks)
     twse_by_code = {s['Code']: s for s in valid}
@@ -1441,7 +1562,7 @@ def generate_closing_report():
     hold_ctx = []
     for code, pos in portfolio.items():
         name = pos.get('name', code)
-        row = twse_by_code.get(code) or _twse_row_from_yfinance(code)
+        row = (None if data_is_stale else twse_by_code.get(code)) or _twse_row_from_yfinance(code)
         if not row:
             holding_sections.append(f"• **{name} ({code})**：今日無交易數據")
             holding_sections.append("")
@@ -1462,7 +1583,7 @@ def generate_closing_report():
     for code, name in tracked.items():
         if code in portfolio:
             continue
-        row = twse_by_code.get(code) or _twse_row_from_yfinance(code)
+        row = (None if data_is_stale else twse_by_code.get(code)) or _twse_row_from_yfinance(code)
         if not row:
             watch_sections.append(f"• **{name} ({code})**：今日無交易數據")
             watch_sections.append("")
@@ -1488,7 +1609,7 @@ def generate_closing_report():
         reason = _reasons.get(code, '')
         line = (
             f"• **{name} ({code})**：[開盤] {c['open_p']}元 → [收盤] {c['close_p']}元"
-            f" ({'漲' if c['change'] >= 0 else '跌'} {abs(c['change']):.1f}元 / {c['pct']:+.2f}%)"
+            f"（{_chg_text(row['_close'], c['change'])}）"
             f" [成交量: {c['zhang']}張]{_src_tag(row)}"
         )
         try:
@@ -1512,7 +1633,7 @@ def generate_closing_report():
         reason = _reasons.get(code, '')
         line = (
             f"• **{name} ({code})**：[開盤] {c['open_p']}元 → [收盤] {c['close_p']}元"
-            f" ({'漲' if c['change'] >= 0 else '跌'} {abs(c['change']):.1f}元 / {c['pct']:+.2f}%)"
+            f"（{_chg_text(row['_close'], c['change'])}）"
             f" [成交量: {c['zhang']}張]{_src_tag(row)}"
         )
         line += _returns_line(code, c['rets'])
@@ -1568,7 +1689,11 @@ def generate_closing_report():
     gm.append("")
     blocks['global_markets'] = gm
 
-    hot = ["🔥 **今日市場熱點掃描：**", "*成交量前五：*"]
+    hot_title = ("🔥 **市場熱點掃描：**" if data_is_stale else "🔥 **今日市場熱點掃描：**")
+    hot = [hot_title]
+    if data_is_stale:
+        hot.append(f"（全市場排行為最近已發布交易日 {twse_date_raw}）")
+    hot.append("*成交量前五：*")
     for s in top_volume:
         hot.append(f"  • {s['Name']} ({s['Code']}): {format_zhang(s['_vol'])}張 ({s['_pct']:+.2f}%)")
     hot.append("")
@@ -1616,7 +1741,8 @@ def generate_closing_report():
         lines.append("")
     lines.append(f"📊 {date_str} 台股收盤報告（{time_str} 數據）")
     if data_is_stale:
-        lines.append(f"⚠️ 注意：TWSE尚未發布今日數據，以下為最近交易日（{twse_date_raw}）數據")
+        lines.append(f"⚠️ 注意：TWSE全市場檔尚未發布今日數據（最新為 {twse_date_raw}）。"
+                     f"持倉與觀察清單改用即時報價，熱點排行仍為 {twse_date_raw}。")
     lines.append(f"數據來源：TWSE官方 / 技術指標：Yahoo Finance")
     lines.append("")
     closing_order = cfg.get('sections', {}).get('closing_order')
