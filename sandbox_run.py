@@ -61,7 +61,7 @@ def main():
         print("Valid options: morning, closing, all", flush=True)
         sys.exit(1)
 
-    data_dir = os.getenv('OPENCLAW_DATA_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
+    data_dir = os.getenv('FRB_DATA_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
     print(f"\n[SANDBOX DONE] Preview files saved in: {data_dir}", flush=True)
 
 

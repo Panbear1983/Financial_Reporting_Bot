@@ -12,7 +12,7 @@ Panels: Portfolio (+CSV import) · Watchlist · Report Schedule · Layout & Cont
 
 Run:
     python3 config_tui.py
-    OPENCLAW_DATA_DIR=/path/to/data python3 config_tui.py
+    FRB_DATA_DIR=/path/to/data python3 config_tui.py
 """
 
 import json
@@ -54,7 +54,7 @@ def _resolve_data_dir():
     dir would silently load the watchlist and drop every holding. Pick the real silo.
     """
     candidates = []
-    env = os.getenv('OPENCLAW_DATA_DIR', '')
+    env = os.getenv('FRB_DATA_DIR', '')
     if env:
         candidates.append(Path(env))
     candidates += [
@@ -92,7 +92,7 @@ IMPORT_DIR = SCRIPT_DIR / 'Import CSV'
 def _resolve_env_path():
     """Find the canonical .env file (outside DATA_DIR, sibling to it on disk)."""
     candidates = [
-        Path(os.getenv('OPENCLAW_ENV_FILE', '')) if os.getenv('OPENCLAW_ENV_FILE') else None,
+        Path(os.getenv('FRB_ENV_FILE', '')) if os.getenv('FRB_ENV_FILE') else None,
         DATA_DIR.parent / '.env',
         Path.home() / 'openclaw-infra' / 'agents' / 'financial-bot' / '.env',
         SCRIPT_DIR / '.env',
@@ -418,7 +418,7 @@ def main_menu():
                 '[bold red]⚠ No portfolio.json in this data dir — HOLDINGS WILL BE EMPTY '
                 '(watchlist-only reports).[/bold red]\n'
                 '[yellow]  Launch via [bold]~/Agents/agents-ctl tui[/bold] (or set '
-                'OPENCLAW_DATA_DIR to your silo) so the report sees your holdings.[/yellow]')
+                'FRB_DATA_DIR to your silo) so the report sees your holdings.[/yellow]')
 
         choice = Prompt.ask('\nSelect', choices=['1','2','3','4','5','6','7','8','9','q'], default='q')
 
@@ -1094,7 +1094,7 @@ def menu_sandbox():
     if choice == 'b':
         return
 
-    env = {**os.environ, 'OPENCLAW_DATA_DIR': str(DATA_DIR)}
+    env = {**os.environ, 'FRB_DATA_DIR': str(DATA_DIR)}
 
     if choice == '4':
         sub = Prompt.ask('Send which? [1] Morning [2] Closing [3] All', choices=['1','2','3'], default='1')

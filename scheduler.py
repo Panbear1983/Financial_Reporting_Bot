@@ -15,7 +15,7 @@ time.tzset()
 
 def _load_bot_config():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir   = os.getenv('OPENCLAW_DATA_DIR', os.path.join(script_dir, 'data'))
+    data_dir   = os.getenv('FRB_DATA_DIR', os.path.join(script_dir, 'data'))
     for directory in (data_dir, script_dir):
         path = os.path.join(directory, 'bot_config.json')
         if os.path.exists(path):
@@ -68,7 +68,7 @@ def run_report(mode='closing'):
 def _report_exists_today(mode):
     """True if a report for today's UTC date and this mode was already archived."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir   = os.getenv('OPENCLAW_DATA_DIR', os.path.join(script_dir, 'data'))
+    data_dir   = os.getenv('FRB_DATA_DIR', os.path.join(script_dir, 'data'))
     reports    = os.path.join(data_dir, 'reports')
     today      = datetime.datetime.utcnow().strftime('%Y-%m-%d')
     try:
@@ -130,7 +130,7 @@ schedule.every().day.at(_closing_utc).do(run_report, mode='closing')
 if SANDBOX:
     print("━" * 55, flush=True)
     print("  SANDBOX MODE ACTIVE — no messages will reach Telegram", flush=True)
-    print("  Preview files saved to OPENCLAW_DATA_DIR on each run", flush=True)
+    print("  Preview files saved to FRB_DATA_DIR on each run", flush=True)
     print("━" * 55, flush=True)
 
 print("Scheduler started. Waiting for next scheduled run...", flush=True)

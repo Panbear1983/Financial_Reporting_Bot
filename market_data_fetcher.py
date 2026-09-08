@@ -17,7 +17,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.getenv('OPENCLAW_DATA_DIR', '/app/data') + '/market_data.log'),
+        logging.FileHandler(os.getenv('FRB_DATA_DIR', '/app/data') + '/market_data.log'),
         logging.StreamHandler()
     ]
 )
@@ -134,7 +134,7 @@ class MarketDataAggregator:
     
     def __init__(self):
         self.data_sources: List[MarketDataSource] = []
-        self.cache_dir = os.path.join(os.getenv('OPENCLAW_DATA_DIR', '/app/data'), 'cache')
+        self.cache_dir = os.path.join(os.getenv('FRB_DATA_DIR', '/app/data'), 'cache')
         os.makedirs(self.cache_dir, exist_ok=True)
 
     def add_data_source(self, source: MarketDataSource):
@@ -215,7 +215,7 @@ def main():
         market_data = aggregator.fetch_market_data()
 
         # Save raw data
-        with open(os.getenv('OPENCLAW_DATA_DIR', '/app/data') + '/market_data.json', 'w', encoding='utf-8') as f:
+        with open(os.getenv('FRB_DATA_DIR', '/app/data') + '/market_data.json', 'w', encoding='utf-8') as f:
             json.dump(market_data, f, ensure_ascii=False, indent=2)
 
         logger.info("Market data collection completed successfully")

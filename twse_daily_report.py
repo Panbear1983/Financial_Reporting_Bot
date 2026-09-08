@@ -31,14 +31,14 @@ from custom_stock_lookup import get_yfinance_data
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR   = os.getenv('OPENCLAW_DATA_DIR', os.path.join(SCRIPT_DIR, 'data'))
+DATA_DIR   = os.getenv('FRB_DATA_DIR', os.path.join(SCRIPT_DIR, 'data'))
 
 # Load .env for standalone/preview runs (OPENROUTER_* / TELEGRAM_* / BRAVE_API_KEY).
-# Honours OPENCLAW_ENV_FILE, else the data-dir / script-dir .env. override=False so
+# Honours FRB_ENV_FILE, else the data-dir / script-dir .env. override=False so
 # an already-populated container environment is never clobbered. Silent no-op if
 # python-dotenv is absent — matches config_tui.py's pattern.
 def _load_env_file():
-    for cand in (os.getenv('OPENCLAW_ENV_FILE'),
+    for cand in (os.getenv('FRB_ENV_FILE'),
                  os.path.join(DATA_DIR, '.env'),
                  os.path.join(SCRIPT_DIR, '.env')):
         if cand and os.path.exists(cand):
@@ -179,7 +179,7 @@ def _render_sandbox(text):
     chunks     = _line_safe_chunks(text)
     total      = len(chunks)
     timestamp  = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    data_dir   = os.getenv('OPENCLAW_DATA_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
+    data_dir   = os.getenv('FRB_DATA_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
     os.makedirs(data_dir, exist_ok=True)
     fname      = f"sandbox_preview_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     fpath      = os.path.join(data_dir, fname)
@@ -1248,7 +1248,7 @@ def generate_morning_report():
     portfolio = load_portfolio()        # {"2330": {"shares": N, "avg_cost": X}, ...}
     date_str  = datetime.datetime.now().strftime('%Y-%m-%d')
     time_str  = datetime.datetime.now().strftime('%H:%M')
-    output_dir = os.getenv('OPENCLAW_DATA_DIR', '/app/data')
+    output_dir = os.getenv('FRB_DATA_DIR', '/app/data')
 
     cfg            = load_bot_config()
     technicals_cfg = cfg.get('technicals', {})
@@ -1488,7 +1488,7 @@ def generate_closing_report():
     portfolio  = load_portfolio()
     date_str   = datetime.datetime.now().strftime('%Y-%m-%d')
     time_str   = datetime.datetime.now().strftime('%H:%M')
-    output_dir = os.getenv('OPENCLAW_DATA_DIR', '/app/data')
+    output_dir = os.getenv('FRB_DATA_DIR', '/app/data')
 
     cfg            = load_bot_config()
     technicals_cfg = cfg.get('technicals', {})
