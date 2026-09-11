@@ -32,6 +32,12 @@ from rich import box
 
 from custom_stock_lookup import get_yfinance_data
 
+# Data comes from the dashboard's single data layer — this module only draws.
+from dashboard import (_OHLC, _QUOTE_URL, _clean_bars, _quote_time, _suffix_cache_path,
+                       compute_positions, fetch_history, fetch_live_quotes,
+                       fetch_quote_batch, resolve_any, resolve_symbols,
+                       taiwan_market_open)
+
 # ---------------------------------------------------------------------------
 # Ranges: key -> (label, yfinance period, yfinance interval, cache TTL secs)
 # Intervals stay within yfinance limits (5m ~60d back, 30m ~60d, 1h ~730d).
@@ -54,222 +60,15 @@ RANGES = {
 QUOTE_TTL_OPEN   = 20    # live board cadence during market hours
 QUOTE_TTL_CLOSED = 600
 
-_QUOTE_URL = 'https://query1.finance.yahoo.com/v7/finance/quote'
-
-_OHLC = ['Open', 'High', 'Low', 'Close']
-
 
 # ---------------------------------------------------------------------------
 # Symbol resolution (.TW vs .TWO) with a persistent cache
 # ---------------------------------------------------------------------------
 
-def _suffix_cache_path(data_dir):
-    return Path(data_dir) / 'ticker_suffix_cache.json'
-
-
-def resolve_symbols(codes, data_dir):
-    """Return {code: full_symbol}. Probes .TW then .TWO once per unknown code
-    and persists the result so refresh cycles never re-probe."""
-    cache_path = _suffix_cache_path(data_dir)
-    try:
-        cache = json.loads(cache_path.read_text(encoding='utf-8'))
-    except Exception:
-        cache = {}
-    dirty = False
-    out = {}
-    for code in codes:
-        suffix = cache.get(code)
-        if suffix not in ('.TW', '.TWO'):
-            suffix = '.TW'
-            for s in ('.TW', '.TWO'):
-                try:
-                    hist = yf.Ticker(f'{code}{s}').history(period='5d')
-                    if not hist.empty:
-                        suffix = s
-                        break
-                except Exception:
-                    continue
-            cache[code] = suffix
-            dirty = True
-        out[code] = f'{code}{suffix}'
-    if dirty:
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(json.dumps(cache, indent=2), encoding='utf-8')
-        except Exception:
-            pass
-    return out
-
-
-_TW_CODE_RE = re.compile(r'^\d{4,6}[A-Z]?$')
-
-
-def resolve_any(text, data_dir):
-    """Resolve arbitrary user input to a yfinance symbol. TW-style codes
-    (2330, 00402A) probe .TW/.TWO via the cache; anything else (AAPL, NVDA,
-    ^TWII, BTC-USD) passes through uppercased."""
-    text = text.strip().upper()
-    if not text:
-        return None
-    if _TW_CODE_RE.match(text):
-        return resolve_symbols([text], data_dir)[text]
-    return text
-
 
 # ---------------------------------------------------------------------------
 # Data fetching
 # ---------------------------------------------------------------------------
-
-def _clean_bars(sub):
-    """Drop all-NaN rows and null out non-positive prices (bad Yahoo ticks
-    would otherwise plot as candles crashing to zero)."""
-    sub = sub.dropna(how='all').copy()
-    cols = [c for c in _OHLC if c in sub.columns]
-    sub[cols] = sub[cols].where(sub[cols] > 0)
-    sub = sub.dropna(subset=cols, how='any')
-    # Normalize intraday timestamps to Taipei so charts show 09:00–13:30 and
-    # cross-symbol index unions never mix timezones.
-    if getattr(sub.index, 'tz', None) is not None:
-        sub.index = sub.index.tz_convert('Asia/Taipei')
-    return sub
-
-
-def fetch_history(symbols, period, interval):
-    """One batched download for all symbols → {symbol: DataFrame(OHLCV)}."""
-    df = yf.download(list(symbols), period=period, interval=interval,
-                     group_by='ticker', auto_adjust=False,
-                     threads=True, progress=False)
-    out = {}
-    if df is None or df.empty:
-        return out
-    if isinstance(df.columns, pd.MultiIndex):
-        for sym in symbols:
-            if sym in df.columns.get_level_values(0):
-                sub = _clean_bars(df[sym])
-                if not sub.empty:
-                    out[sym] = sub
-    else:                                   # single-ticker downloads come back flat
-        sub = _clean_bars(df)
-        if not sub.empty:
-            out[list(symbols)[0]] = sub
-    return out
-
-
-def _quote_time(epoch):
-    """Yahoo's regularMarketTime (unix secs) → local-tz datetime, or None."""
-    try:
-        return (datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc)
-                .astimezone())
-    except (TypeError, ValueError, OSError, OverflowError):
-        return None
-
-
-def fetch_quote_batch(symbols):
-    """{symbol: raw Yahoo quote} for every symbol in ONE authenticated request.
-
-    yf.download — the path the live board used to take — issues one HTTP call per
-    ticker, so quote cadence scaled with portfolio size and any refresh fast enough
-    to look live risked the 429s that once blanked the board. This endpoint returns
-    the whole book in a single call, so the cadence is independent of how many
-    holdings there are.
-
-    It also carries the authoritative regularMarketPreviousClose. Deriving that
-    from a 5d daily frame's second-to-last ROW silently picked the wrong DAY
-    whenever Yahoo's frame had a hole (0050/006208 were missing 2026-08-12), which
-    quietly corrupted Chg% and Daily P/L. Returns {} on any failure — callers fall
-    back to the frame path.
-    """
-    try:
-        import yfinance.data as yfd
-        r = yfd.YfData().get_raw_json(_QUOTE_URL, params={'symbols': ','.join(symbols)})
-        return {q['symbol']: q for q in r.get('quoteResponse', {}).get('result', [])
-                if q.get('symbol')}
-    except Exception:
-        return {}
-
-
-def fetch_live_quotes(codes, symbol_map, daily=None):
-    """{code: {price, prev_close, intraday, quote_at, ...}} for the live board.
-
-    Primary path is one batched quote call (fetch_quote_batch). Anything it
-    doesn't cover falls back to per-symbol OHLC frames — prev_close from the daily
-    frame, price from the freshest 1-minute bar when one exists, else the daily
-    close. `daily` lets a caller inject that frame instead of fetching it.
-
-    quote['intraday'] records whether the price can still move this session: a
-    batched market quote can, a price that fell back to the daily close cannot,
-    and the board marks the latter rather than letting it read as a flat market.
-    quote['quote_at'] is the exchange-side timestamp (datetime, when Yahoo gives
-    one) — the honest answer to "how live is this number", since the TW feed is
-    delayed and repainting the screen doesn't make a price newer.
-    """
-    syms = [symbol_map[c] for c in codes]
-    batch = fetch_quote_batch(syms)
-
-    quotes, missing = {}, []
-    for code in codes:
-        b = batch.get(symbol_map[code]) or {}
-        price, prev_close = b.get('regularMarketPrice'), b.get('regularMarketPreviousClose')
-        if price is None or prev_close is None:
-            missing.append(code)
-            continue
-        price, prev_close = float(price), float(prev_close)
-        qt = b.get('regularMarketTime')
-        quotes[code] = {
-            'name': b.get('shortName') or code, 'price': price, 'prev_close': prev_close,
-            'intraday': True, 'quote_at': _quote_time(qt),
-            'today_open': float(b.get('regularMarketOpen') or price),
-            'change': price - prev_close, 'intraday_change': 0.0,
-        }
-
-    # Frame fallback, for the missing symbols only — usually nobody.
-    if missing:
-        msyms = [symbol_map[c] for c in missing]
-        if daily is None:
-            daily = fetch_history(msyms, period='5d', interval='1d')
-        try:
-            intra = fetch_history(msyms, period='1d', interval='1m')
-        except Exception:
-            intra = {}
-        still_missing = []
-        for code in missing:
-            sym = symbol_map[code]
-            d = daily.get(sym)
-            closes = (d['Close'].dropna()
-                      if d is not None and 'Close' in getattr(d, 'columns', []) else None)
-            if closes is None or closes.empty:
-                still_missing.append(code)
-                continue
-            prev_close = float(closes.iloc[-2]) if len(closes) >= 2 else float(closes.iloc[-1])
-            price = float(closes.iloc[-1])
-            live = False
-            iv = intra.get(sym)
-            if iv is not None and 'Close' in getattr(iv, 'columns', []):
-                ic = iv['Close'].dropna()
-                if not ic.empty:
-                    price = float(ic.iloc[-1])   # freshest intraday price this session
-                    live = True
-            quotes[code] = {
-                'name': code, 'price': price, 'prev_close': prev_close, 'intraday': live,
-                'quote_at': None, 'today_open': price,
-                'change': price - prev_close, 'intraday_change': 0.0,
-            }
-        missing = still_missing
-
-    # Last-ditch per-stock fallback (hardened get_yfinance_data) for anything
-    # neither the batch quote nor the OHLC frames could resolve — thin or
-    # newly-listed symbols that Yahoo's bulk endpoints occasionally drop.
-    if missing:
-        def one(code):
-            return code, get_yfinance_data(symbol_map[code])
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            for code, q in ex.map(one, missing):
-                if q:
-                    # regularMarketPrice off the chart endpoint is a live quote,
-                    # so this path is never the frozen-at-last-close case.
-                    q.setdefault('intraday', True)
-                    quotes[code] = q
-    return quotes
 
 
 def portfolio_ohlc(hist, portfolio, symbol_map, quotes=None):
@@ -309,16 +108,6 @@ def portfolio_ohlc(hist, portfolio, symbol_map, quotes=None):
     closes = pd.concat([f['Close'].reindex(idx) for _, f in frames], axis=1)
     keep = closes.notna().sum(axis=1) >= max(1, len(frames) // 2)
     return total[keep], len(flat)
-
-
-def taiwan_market_open(now=None):
-    if os.getenv('LIVE_PORTFOLIO_FORCE_OPEN') == '1':
-        return True
-    now = now or datetime.datetime.now(ZoneInfo('Asia/Taipei'))
-    if now.weekday() >= 5:
-        return False
-    t = now.time()
-    return datetime.time(9, 0) <= t <= datetime.time(13, 30)
 
 
 # ---------------------------------------------------------------------------
@@ -413,70 +202,6 @@ def _fmt_signed(v, pct=False):
     # TW convention: red = up, green = down
     color = 'red' if v > 0 else ('green' if v < 0 else 'white')
     return f'[{color}]{s}[/{color}]'
-
-
-def compute_positions(portfolio, quotes, market_open=None):
-    """THE position maths for this project — rows + totals, no rendering.
-
-    Single source of truth, shared by the live board and by the TWSE morning
-    report's 持倉 block. The report used to fetch its own prices and redo this
-    arithmetic itself, so the two could (and did) disagree: on 2026-09-11 the
-    Telegram push said 今日損益 -102,150元 against the board's -88,000元, because
-    the report derived 昨收 by counting backwards through a Yahoo daily frame
-    that silently omits ETF sessions. One fetch + one calculation removes that
-    whole class of drift by construction.
-
-    Returns {'rows': [...], 'total': {...}, 'n_unpriced': int, 'frozen': [codes]}.
-    A holding with no quote is carried in rows with price=None and is excluded
-    from the totals — its cost too, so one failed quote cannot book a position
-    as a total loss.
-    """
-    if market_open is None:
-        market_open = taiwan_market_open()
-
-    rows, frozen, n_unpriced = [], [], 0
-    tot_val = tot_cost = tot_daily_pnl = 0.0
-    for code, pos in portfolio.items():
-        sh, cost = pos.get('shares', 0), pos.get('cost_basis', 0)
-        q = quotes.get(code)
-        if not q:
-            n_unpriced += 1
-            rows.append({'code': code, 'name': pos.get('name', ''), 'shares': sh,
-                         'cost': cost, 'price': None, 'prev_close': None,
-                         'change': None, 'chg_pct': None, 'value': None,
-                         'pnl': None, 'pnl_pct': None, 'daily_pnl': None,
-                         'intraday': None, 'stale': False})
-            continue
-
-        price, prev = q['price'], q['prev_close']
-        change    = (price - prev) if prev else 0.0
-        chg_pct   = (change / prev * 100) if prev else 0.0
-        daily_pnl = change * sh if prev else 0.0
-        val       = price * sh
-        pnl       = val - cost
-        # A price that cannot tick this session (no intraday feed) is still a
-        # real number, but the board and the report both have to say so.
-        stale = bool(market_open and not q.get('intraday', True))
-        if stale:
-            frozen.append(code)
-
-        tot_val       += val
-        tot_cost      += cost
-        tot_daily_pnl += daily_pnl
-        rows.append({'code': code, 'name': pos.get('name', ''), 'shares': sh,
-                     'cost': cost, 'price': price, 'prev_close': prev,
-                     'change': change, 'chg_pct': chg_pct, 'value': val,
-                     'pnl': pnl, 'pnl_pct': (pnl / cost * 100) if cost else 0.0,
-                     'daily_pnl': daily_pnl, 'intraday': q.get('intraday', True),
-                     'stale': stale})
-
-    total = {
-        'value': tot_val, 'cost': tot_cost, 'daily_pnl': tot_daily_pnl,
-        'pnl': tot_val - tot_cost,
-        'pnl_pct': ((tot_val - tot_cost) / tot_cost * 100) if tot_cost else 0.0,
-        'n_priced': len(portfolio) - n_unpriced, 'n_total': len(portfolio),
-    }
-    return {'rows': rows, 'total': total, 'n_unpriced': n_unpriced, 'frozen': frozen}
 
 
 def build_live_table(portfolio, quotes, market_open=None):
