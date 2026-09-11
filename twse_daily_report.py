@@ -25,6 +25,9 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from market_data_fetcher import TWSDDataSource
 from custom_stock_lookup import get_yfinance_data
+# The live board owns price fetching and the position maths for this project.
+# The morning report renders ITS numbers rather than deriving a second set.
+import live_portfolio as board
 
 # ---------------------------------------------------------------------------
 # Config
@@ -1320,17 +1323,41 @@ def generate_morning_report():
     print(f"[{_now()}] [MORNING] Prefetching stock histories (batched)...")
     prefetch_stock_histories(list(portfolio) + [c for c in tracked if c not in portfolio])
 
-    # 昨收 comes from the exchange, not from Yahoo's daily frame — see fetch_prev_closes.
-    print(f"[{_now()}] [MORNING] Fetching official previous-session closes...")
-    _prev_official = fetch_prev_closes()
+    # ── Prices and position maths: the live board's code, not a second pipeline ──
+    # Every 持倉 figure below is read from board.compute_positions(), the same
+    # function the TUI's live table renders. The report used to fetch its own
+    # quotes and redo the arithmetic, so the two drifted apart whenever a source
+    # misbehaved — on 2026-09-11 the push said 今日損益 -102,150元 against the
+    # board's -88,000元. Sharing the fetch and the calculation removes that by
+    # construction: there is now one number, displayed twice.
+    _all_codes = list(portfolio) + [c for c in tracked if c not in portfolio]
+    print(f"[{_now()}] [MORNING] Quotes via live board ({len(_all_codes)} codes)...")
+    _symbols = board.resolve_symbols(_all_codes, DATA_DIR)
+    _quotes  = board.fetch_live_quotes(_all_codes, _symbols)
+    _calc    = board.compute_positions(portfolio, _quotes)
+    _row_by_code = {r['code']: r for r in _calc['rows']}
 
-    print(f"[{_now()}] [MORNING] Fetching holdings (yfinance live)...")
+    # Cross-check only — never alters a printed number. 昨收 from the exchange is
+    # compared against what the board used; a disagreement is surfaced in the
+    # message instead of silently changing the maths behind the board's back.
+    print(f"[{_now()}] [MORNING] Cross-checking 昨收 against the exchange...")
+    _prev_official = fetch_prev_closes()
+    _prev_mismatch = sorted(
+        r['code'] for r in _calc['rows']
+        if r['prev_close'] and _prev_official.get(r['code'])
+        and abs(r['prev_close'] - _prev_official[r['code']]) > 0.005
+    )
+    if _prev_mismatch:
+        print(f"[{_now()}] ⚠ 昨收 disagrees with the exchange for: {', '.join(_prev_mismatch)}")
+
+    print(f"[{_now()}] [MORNING] Building holdings...")
     holding_sections = []
     holdings_data    = []
     stock_summary    = []
-    pf_daily_total   = 0.0
-    pf_gain_total    = 0.0
-    pf_cost_total    = 0.0
+    # Straight off the shared calculation — the same totals the board's Total row shows.
+    pf_daily_total = _calc['total']['daily_pnl']
+    pf_gain_total  = _calc['total']['pnl']
+    pf_cost_total  = _calc['total']['cost']
 
     _valuation = fetch_valuation()
     _margin    = fetch_margin()
@@ -1339,16 +1366,14 @@ def generate_morning_report():
     hold_ctx = []
     for code, pos in portfolio.items():
         name = pos.get('name', code)
-        d = fetch_yfinance_stock(code)
+        r = _row_by_code.get(code)
         rsi, vol_ratio = fetch_stock_technicals(code, opening_mode=True, period_days=period_days)
-        if d:
-            price    = d['price']
-            prev_cls = _prev_official.get(code) or d['prev_close']
-            change   = price - prev_cls
-            pct = change / prev_cls * 100 if prev_cls else 0.0
+        if r and r['price'] is not None:
             hold_ctx.append({
                 'code': code, 'name': name, 'pos': pos,
-                'price': price, 'prev_cls': prev_cls, 'change': change, 'pct': pct,
+                'price': r['price'], 'prev_cls': r['prev_close'],
+                'change': r['change'], 'pct': r['chg_pct'],
+                'daily_pnl': r['daily_pnl'], 'stale': r['stale'],
                 'rsi': rsi, 'vol_ratio': vol_ratio, 'zhang': 'N/A',
             })
         else:
@@ -1362,12 +1387,12 @@ def generate_morning_report():
     for code, name in tracked.items():
         if code in portfolio:
             continue
-        d = fetch_yfinance_stock(code)
+        d = _quotes.get(code) or fetch_yfinance_stock(code)
         rsi, vol_ratio = fetch_stock_technicals(code, opening_mode=True, period_days=period_days)
         if d:
             price    = d['price']
-            prev_cls = _prev_official.get(code) or d['prev_close']
-            change   = price - prev_cls
+            prev_cls = d['prev_close']
+            change   = price - prev_cls if prev_cls else 0.0
             pct = change / prev_cls * 100 if prev_cls else 0.0
             watch_ctx.append({
                 'code': code, 'name': name,
@@ -1394,12 +1419,6 @@ def generate_morning_report():
             f"• **{name} ({code})**：目前 {price:,.1f}元"
             f" [昨收 {prev_cls:,.1f} | {direction}{abs(change):.1f}元 ({pct:+.2f}%)]"
         )
-        try:
-            pf_daily_total += c['pos']['shares'] * change
-            pf_gain_total  += c['pos']['shares'] * price - c['pos']['cost_basis']
-            pf_cost_total  += c['pos']['cost_basis']
-        except (ValueError, TypeError, KeyError):
-            pass
         if reason:
             line += f"\n  展望：{reason}"
         line += _stock_note(cfg, code)
@@ -1448,6 +1467,12 @@ def generate_morning_report():
             f"💰 今日持倉：今日損益 {d_sign}{pf_daily_total:,.0f}元"
             f" | 持倉總損益 {t_sign}{pf_gain_total:,.0f}元 ({pf_total_pct:+.1f}%)"
         )
+        # A partial total must never read as the market moving.
+        if _calc['n_unpriced']:
+            pf_summary += (f"\n⚠️ 僅含 {_calc['total']['n_priced']}/{_calc['total']['n_total']} "
+                           f"檔（其餘無報價，未計入）")
+        if _prev_mismatch:
+            pf_summary += f"\n⚠️ 昨收與交易所紀錄不符：{'、'.join(_prev_mismatch)}"
 
     # Assemble — build each section block, then emit in the configured order
     blocks = {}

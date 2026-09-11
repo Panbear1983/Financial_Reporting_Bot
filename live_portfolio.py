@@ -415,15 +415,80 @@ def _fmt_signed(v, pct=False):
     return f'[{color}]{s}[/{color}]'
 
 
-def build_live_table(portfolio, quotes, market_open=None):
-    """Returns (table, n_unpriced, frozen_codes).
+def compute_positions(portfolio, quotes, market_open=None):
+    """THE position maths for this project — rows + totals, no rendering.
 
-    n_unpriced / frozen_codes are the two ways the board can lie about being
-    live, handed back so the caller can annotate them: holdings with no quote at
-    all (excluded from the totals entirely) and holdings priced off the daily
-    close because no 1-minute bar exists (shown, but unable to tick)."""
+    Single source of truth, shared by the live board and by the TWSE morning
+    report's 持倉 block. The report used to fetch its own prices and redo this
+    arithmetic itself, so the two could (and did) disagree: on 2026-09-11 the
+    Telegram push said 今日損益 -102,150元 against the board's -88,000元, because
+    the report derived 昨收 by counting backwards through a Yahoo daily frame
+    that silently omits ETF sessions. One fetch + one calculation removes that
+    whole class of drift by construction.
+
+    Returns {'rows': [...], 'total': {...}, 'n_unpriced': int, 'frozen': [codes]}.
+    A holding with no quote is carried in rows with price=None and is excluded
+    from the totals — its cost too, so one failed quote cannot book a position
+    as a total loss.
+    """
     if market_open is None:
         market_open = taiwan_market_open()
+
+    rows, frozen, n_unpriced = [], [], 0
+    tot_val = tot_cost = tot_daily_pnl = 0.0
+    for code, pos in portfolio.items():
+        sh, cost = pos.get('shares', 0), pos.get('cost_basis', 0)
+        q = quotes.get(code)
+        if not q:
+            n_unpriced += 1
+            rows.append({'code': code, 'name': pos.get('name', ''), 'shares': sh,
+                         'cost': cost, 'price': None, 'prev_close': None,
+                         'change': None, 'chg_pct': None, 'value': None,
+                         'pnl': None, 'pnl_pct': None, 'daily_pnl': None,
+                         'intraday': None, 'stale': False})
+            continue
+
+        price, prev = q['price'], q['prev_close']
+        change    = (price - prev) if prev else 0.0
+        chg_pct   = (change / prev * 100) if prev else 0.0
+        daily_pnl = change * sh if prev else 0.0
+        val       = price * sh
+        pnl       = val - cost
+        # A price that cannot tick this session (no intraday feed) is still a
+        # real number, but the board and the report both have to say so.
+        stale = bool(market_open and not q.get('intraday', True))
+        if stale:
+            frozen.append(code)
+
+        tot_val       += val
+        tot_cost      += cost
+        tot_daily_pnl += daily_pnl
+        rows.append({'code': code, 'name': pos.get('name', ''), 'shares': sh,
+                     'cost': cost, 'price': price, 'prev_close': prev,
+                     'change': change, 'chg_pct': chg_pct, 'value': val,
+                     'pnl': pnl, 'pnl_pct': (pnl / cost * 100) if cost else 0.0,
+                     'daily_pnl': daily_pnl, 'intraday': q.get('intraday', True),
+                     'stale': stale})
+
+    total = {
+        'value': tot_val, 'cost': tot_cost, 'daily_pnl': tot_daily_pnl,
+        'pnl': tot_val - tot_cost,
+        'pnl_pct': ((tot_val - tot_cost) / tot_cost * 100) if tot_cost else 0.0,
+        'n_priced': len(portfolio) - n_unpriced, 'n_total': len(portfolio),
+    }
+    return {'rows': rows, 'total': total, 'n_unpriced': n_unpriced, 'frozen': frozen}
+
+
+def build_live_table(portfolio, quotes, market_open=None):
+    """Rich rendering of compute_positions() for the live board.
+
+    Returns (table, n_unpriced, frozen_codes) — the latter two are the ways the
+    board can lie about being live: holdings with no quote at all (excluded from
+    the totals entirely) and holdings priced off the daily close because no
+    1-minute bar exists (shown, but unable to tick)."""
+    if market_open is None:
+        market_open = taiwan_market_open()
+    calc = compute_positions(portfolio, quotes, market_open)
     t = Table(title='Portfolio Holdings — Live', box=box.ROUNDED)
     for col, kw in [('#', dict(style='dim', width=3, justify='right')),
                     ('Code', dict(style='bold cyan', width=8)),
@@ -437,49 +502,30 @@ def build_live_table(portfolio, quotes, market_open=None):
                     ('Daily P/L', dict(justify='right'))]:
         t.add_column(col, **kw)
 
-    tot_val = tot_cost = tot_daily_pnl = 0.0
-    n_unpriced, frozen = 0, []
-    for i, (code, pos) in enumerate(portfolio.items(), 1):
-        sh, cost = pos.get('shares', 0), pos.get('cost_basis', 0)
-        q = quotes.get(code)
-        if q:
-            price = q['price']
-            chg_pct = (price - q['prev_close']) / q['prev_close'] * 100 if q['prev_close'] else 0
-            daily_pnl = (price - q['prev_close']) * sh if q['prev_close'] else 0
-            val = price * sh
-            pnl = val - cost
-            pnl_pct = pnl / cost * 100 if cost else 0
-            tot_val += val
-            # Cost joins the total only alongside its own market value. Adding it
-            # unconditionally booked an unpriced holding's entire position as a
-            # loss, so one failed quote could sink the whole portfolio's P/L.
-            tot_cost += cost
-            tot_daily_pnl += daily_pnl
-            px = f'{price:,.2f}'
-            if market_open and not q.get('intraday', True):
-                px = f'[dim]{px}[/dim]'      # can't tick — see the note under the table
-                frozen.append(code)
-            t.add_row(str(i), code, pos.get('name', ''), f'{sh:,}',
-                      px, _fmt_signed(chg_pct, pct=True),
-                      f'{val:,.0f}', _fmt_signed(pnl),
-                      _fmt_signed(pnl_pct, pct=True), _fmt_signed(daily_pnl))
-        else:
-            n_unpriced += 1
-            t.add_row(str(i), code, pos.get('name', ''), f'{sh:,}',
+    for i, r in enumerate(calc['rows'], 1):
+        if r['price'] is None:
+            t.add_row(str(i), r['code'], r['name'], f"{r['shares']:,}",
                       '[dim]…[/dim]', '', '', '', '', '')
+            continue
+        px = f"{r['price']:,.2f}"
+        if r['stale']:
+            px = f'[dim]{px}[/dim]'          # can't tick — see the note under the table
+        t.add_row(str(i), r['code'], r['name'], f"{r['shares']:,}",
+                  px, _fmt_signed(r['chg_pct'], pct=True),
+                  f"{r['value']:,.0f}", _fmt_signed(r['pnl']),
+                  _fmt_signed(r['pnl_pct'], pct=True), _fmt_signed(r['daily_pnl']))
 
-    if tot_val:
-        pnl = tot_val - tot_cost
+    tot = calc['total']
+    if tot['value']:
         # Say so when the Total covers only part of the book, so a shrunken
         # figure is never mistaken for the market moving.
-        label = ('Total' if not n_unpriced
-                 else f'Total ({len(portfolio) - n_unpriced}/{len(portfolio)})')
+        label = ('Total' if not calc['n_unpriced']
+                 else f"Total ({tot['n_priced']}/{tot['n_total']})")
         t.add_section()
         t.add_row('', '', f'[bold]{label}[/bold]', '', '',
-                  '', f'[bold]{tot_val:,.0f}[/bold]', _fmt_signed(pnl),
-                  _fmt_signed(pnl / tot_cost * 100 if tot_cost else 0, pct=True),
-                  _fmt_signed(tot_daily_pnl))
-    return t, n_unpriced, frozen
+                  '', f"[bold]{tot['value']:,.0f}[/bold]", _fmt_signed(tot['pnl']),
+                  _fmt_signed(tot['pnl_pct'], pct=True), _fmt_signed(tot['daily_pnl']))
+    return t, calc['n_unpriced'], calc['frozen']
 
 
 # ---------------------------------------------------------------------------
