@@ -650,6 +650,57 @@ def fetch_yfinance_stock(code):
     return None
 
 
+def fetch_prev_closes(max_lookback=10):
+    """{code: 昨收} — official closes for the most recent session STRICTLY BEFORE today.
+
+    The morning report derived 昨收 from the cached daily history frame's
+    second-to-last row (_quote_from_history). Yahoo silently OMITS daily bars for
+    Taiwan ETFs — 0050/009802/006208/009816/009828/00402A had no 2026-09-10 bar at
+    all, the frame jumping 09-09 → 09-11 — so "the row before last" was two sessions
+    back. Every ETF was then measured against the wrong day: on 2026-09-11 the push
+    said 今日損益 -102,150元 when the real figure was about -88,000元. Ordinary
+    stocks were unaffected, which is why the error looked arbitrary.
+
+    Listed board from MI_INDEX, 上櫃 from the TPEX mainboard feed (used only when
+    its single published session is the one resolved here). Returns {} if nothing
+    resolves, in which case callers keep the Yahoo value.
+    """
+    today = datetime.datetime.now().date()
+    for back in range(1, max_lookback + 1):
+        day = today - datetime.timedelta(days=back)
+        if day.weekday() >= 5:                      # skip Sat/Sun outright
+            continue
+        ymd  = day.strftime('%Y%m%d')
+        rows = fetch_twse_mi_index(ymd)
+        if not rows:                                # holiday or not published
+            continue
+
+        out = {}
+        for r in rows:
+            try:
+                out[r['Code']] = float(str(r['ClosingPrice']).replace(',', ''))
+            except (ValueError, TypeError):
+                continue
+
+        roc = _roc_date(ymd)
+        try:
+            for s in fetch_tpex_all():
+                if s.get('Date') != roc or s.get('Code') in out:
+                    continue
+                try:
+                    out[s['Code']] = float(str(s['ClosingPrice']).replace(',', ''))
+                except (ValueError, TypeError):
+                    continue
+        except Exception as e:
+            print(f"[{_now()}] Prev-close TPEX leg failed: {e}")
+
+        print(f"[{_now()}] Prev-session closes: {roc} ({len(out)} codes)")
+        return out
+
+    print(f"[{_now()}] Prev-session closes: none resolved — keeping Yahoo 昨收")
+    return {}
+
+
 def _roc_date(yyyymmdd):
     """'20260904' -> '1150904' (ROC year = Gregorian - 1911), matching STOCK_DAY_ALL."""
     try:
@@ -1269,6 +1320,10 @@ def generate_morning_report():
     print(f"[{_now()}] [MORNING] Prefetching stock histories (batched)...")
     prefetch_stock_histories(list(portfolio) + [c for c in tracked if c not in portfolio])
 
+    # 昨收 comes from the exchange, not from Yahoo's daily frame — see fetch_prev_closes.
+    print(f"[{_now()}] [MORNING] Fetching official previous-session closes...")
+    _prev_official = fetch_prev_closes()
+
     print(f"[{_now()}] [MORNING] Fetching holdings (yfinance live)...")
     holding_sections = []
     holdings_data    = []
@@ -1287,7 +1342,9 @@ def generate_morning_report():
         d = fetch_yfinance_stock(code)
         rsi, vol_ratio = fetch_stock_technicals(code, opening_mode=True, period_days=period_days)
         if d:
-            price, prev_cls, change = d['price'], d['prev_close'], d['change']
+            price    = d['price']
+            prev_cls = _prev_official.get(code) or d['prev_close']
+            change   = price - prev_cls
             pct = change / prev_cls * 100 if prev_cls else 0.0
             hold_ctx.append({
                 'code': code, 'name': name, 'pos': pos,
@@ -1308,7 +1365,9 @@ def generate_morning_report():
         d = fetch_yfinance_stock(code)
         rsi, vol_ratio = fetch_stock_technicals(code, opening_mode=True, period_days=period_days)
         if d:
-            price, prev_cls, change = d['price'], d['prev_close'], d['change']
+            price    = d['price']
+            prev_cls = _prev_official.get(code) or d['prev_close']
+            change   = price - prev_cls
             pct = change / prev_cls * 100 if prev_cls else 0.0
             watch_ctx.append({
                 'code': code, 'name': name,
