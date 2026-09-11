@@ -26,7 +26,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Every number in this file comes from the dashboard. This module renders and
 # sends; it does not fetch and it does not calculate. See dashboard.py's header.
 import dashboard
-from dashboard import (DATA_DIR, SCRIPT_DIR, _attach_signals, _config_path, _now,
+import report_voice
+from dashboard import (DATA_DIR, SCRIPT_DIR, format_zhang, _attach_signals, _config_path, _now,
                        _twse_row_from_yfinance, compute_positions, fetch_brave_news,
                        fetch_global_indices, fetch_live_quotes, fetch_margin,
                        fetch_period_returns, fetch_prev_closes, fetch_stock_technicals,
@@ -238,34 +239,40 @@ def deliver_report(text, cfg=None):
         return
     if cfg is None:
         cfg = load_bot_config()
+
     channels = [c for c in (cfg.get('delivery', {}) or {}).get('channels', []) if c.get('enabled', True)]
+    voice_targets = []
     if not channels:
-        _send_telegram(os.getenv('TELEGRAM_BOT_TOKEN'), os.getenv('TELEGRAM_CHAT_ID'), text)
+        token, chat_id = os.getenv('TELEGRAM_BOT_TOKEN'), os.getenv('TELEGRAM_CHAT_ID')
+        _send_telegram(token, chat_id, text)
+        voice_targets.append((token, chat_id))
+    else:
+        for ch in channels:
+            ctype = (ch.get('type') or 'telegram').lower()
+            name  = ch.get('name', ctype)
+            if ctype == 'telegram':
+                token   = os.getenv(ch.get('token_env', 'TELEGRAM_BOT_TOKEN')) or os.getenv('TELEGRAM_BOT_TOKEN')
+                chat_id = ch.get('chat_id') or os.getenv('TELEGRAM_CHAT_ID')
+                _send_telegram(token, chat_id, text)
+                if ch.get('voice', True):
+                    voice_targets.append((token, chat_id))
+            else:
+                print(f"[{_now()}] Channel '{name}' (type={ctype}) configured but OpenClaw has no "
+                      f"{ctype} gateway yet — skipped, not sent.")
+
+    # STRICTLY AFTER the text. Synthesis is a slow network round-trip (minutes for a
+    # long report), so rendering first would delay the report itself — and a voice
+    # failure must never cost a delivered push. Rendered once, shared by all targets.
+    if not voice_targets:
         return
-    for ch in channels:
-        ctype = (ch.get('type') or 'telegram').lower()
-        name  = ch.get('name', ctype)
-        if ctype == 'telegram':
-            token   = os.getenv(ch.get('token_env', 'TELEGRAM_BOT_TOKEN')) or os.getenv('TELEGRAM_BOT_TOKEN')
-            chat_id = ch.get('chat_id') or os.getenv('TELEGRAM_CHAT_ID')
-            _send_telegram(token, chat_id, text)
-        else:
-            print(f"[{_now()}] Channel '{name}' (type={ctype}) configured but OpenClaw has no "
-                  f"{ctype} gateway yet — skipped, not sent.")
+    voice_data = report_voice.render(text, cfg)
+    for token, chat_id in voice_targets:
+        report_voice.send(token, chat_id, voice_data)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def format_zhang(volume):
-    """Convert raw share volume (int or comma-string) to 張 string."""
-    try:
-        vol = int(str(volume).replace(',', ''))
-        return f"{vol // 1000:,}"
-    except:
-        return str(volume)
 
 
 def get_market_sentiment(pct):
