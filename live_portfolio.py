@@ -34,7 +34,7 @@ from custom_stock_lookup import get_yfinance_data
 
 # Data comes from the dashboard's single data layer — this module only draws.
 from dashboard import (_OHLC, _QUOTE_URL, _clean_bars, _quote_time, _suffix_cache_path,
-                       compute_positions, fetch_history, fetch_live_quotes,
+                       close_streak, compute_positions, fetch_history, fetch_live_quotes,
                        fetch_quote_batch, resolve_any, resolve_symbols,
                        taiwan_market_open)
 
@@ -59,6 +59,12 @@ RANGES = {
 # 45 req/min and straight into the 429s that used to blank the board.
 QUOTE_TTL_OPEN   = 20    # live board cadence during market hours
 QUOTE_TTL_CLOSED = 600
+# Daily closes behind the Streak / Run% columns: one batched daily download,
+# held for an hour. The cache is also thrown away the moment the market opens
+# or closes, so today's bar is dropped / added on time rather than up to an
+# hour late (see close_streak).
+DAILY_TTL        = 3600
+DAILY_RETRY      = 60    # min gap between daily-fetch attempts (Yahoo throttles)
 
 
 # ---------------------------------------------------------------------------
@@ -210,8 +216,25 @@ def _fmt_signed(v, pct=False):
     return f'[{color}]{s}[/{color}]'
 
 
-def build_live_table(portfolio, quotes, market_open=None):
+def _fmt_streak(streaks, code):
+    """(Streak cell, Run% cell). streaks=None → daily bars not fetched yet;
+    a code missing from a fetched dict → no daily bars for it."""
+    if streaks is None:
+        return '[dim]…[/dim]', ''
+    sk = streaks.get(code)
+    if sk is None:
+        return '[dim]—[/dim]', ''
+    if sk['run'] == 0:
+        return '[dim]0[/dim]', '[dim]0.00%[/dim]'
+    color = 'red' if sk['run'] > 0 else 'green'      # TW convention, as above
+    return f"[{color}]{sk['run']:+d}[/{color}]", _fmt_signed(sk['pct'], pct=True)
+
+
+def build_live_table(portfolio, quotes, market_open=None, streaks=None):
     """Rich rendering of compute_positions() for the live board.
+
+    streaks: {code: close_streak()} for the Streak / Run% columns, or None
+    while the daily bars are still being fetched.
 
     Returns (table, n_unpriced, frozen_codes) — the latter two are the ways the
     board can lie about being live: holdings with no quote at all (excluded from
@@ -232,13 +255,16 @@ def build_live_table(portfolio, quotes, market_open=None):
                     ('Mkt Value', dict(justify='right')),
                     ('P/L', dict(justify='right')),
                     ('P/L%', dict(justify='right')),
-                    ('Daily P/L', dict(justify='right'))]:
+                    ('Daily P/L', dict(justify='right')),
+                    ('Streak', dict(justify='right')),
+                    ('Run%', dict(justify='right'))]:
         t.add_column(col, **kw)
 
     for i, r in enumerate(calc['rows'], 1):
+        streak, run_pct = _fmt_streak(streaks, r['code'])
         if r['price'] is None:
             t.add_row(str(i), r['code'], r['name'], f"{r['shares']:,}",
-                      '[dim]…[/dim]', '', '', '', '', '')
+                      '[dim]…[/dim]', '', '', '', '', '', streak, run_pct)
             continue
         px = f"{r['price']:,.2f}"
         if r['stale']:
@@ -246,7 +272,8 @@ def build_live_table(portfolio, quotes, market_open=None):
         t.add_row(str(i), r['code'], r['name'], f"{r['shares']:,}",
                   px, _fmt_signed(r['chg_pct'], pct=True),
                   f"{r['value']:,.0f}", _fmt_signed(r['pnl']),
-                  _fmt_signed(r['pnl_pct'], pct=True), _fmt_signed(r['daily_pnl']))
+                  _fmt_signed(r['pnl_pct'], pct=True), _fmt_signed(r['daily_pnl']),
+                  streak, run_pct)
 
     tot = calc['total']
     if tot['value']:
@@ -257,7 +284,8 @@ def build_live_table(portfolio, quotes, market_open=None):
         t.add_section()
         t.add_row('', '', f'[bold]{label}[/bold]', '', '',
                   '', f"[bold]{tot['value']:,.0f}[/bold]", _fmt_signed(tot['pnl']),
-                  _fmt_signed(tot['pnl_pct'], pct=True), _fmt_signed(tot['daily_pnl']))
+                  _fmt_signed(tot['pnl_pct'], pct=True), _fmt_signed(tot['daily_pnl']),
+                  '', '')
     return t, calc['n_unpriced'], calc['frozen']
 
 
@@ -318,7 +346,8 @@ class _Worker(threading.Thread):
         self.stop_event = threading.Event()
         self.range_key = '1'                 # currently displayed range
         self.state = {'quotes': {}, 'quotes_at': None, 'quotes_try_at': None,
-                      'hist': {}, 'compare': None, 'error': '', 'backoff': 1}
+                      'hist': {}, 'compare': None, 'error': '', 'backoff': 1,
+                      'daily': None, 'daily_try_at': None, 'streaks': None}
 
     def set_range(self, key):
         with self.lock:
@@ -374,6 +403,27 @@ class _Worker(threading.Thread):
                     self.state['error'] = ''
                 else:
                     self.state['error'] = 'quote fetch returned nothing (throttled?)'
+
+        # Daily closes → Streak / Run% (see DAILY_TTL). Refetch on the open/close
+        # edge too: the streak counts closed sessions only, so today's bar has to
+        # leave the count at 09:00 and join it at 13:30.
+        mkt_open = taiwan_market_open()
+        daily = st['daily']
+        need = (daily is None or daily['open'] != mkt_open
+                or self._stale(daily['at'], DAILY_TTL * backoff))
+        if need and self._stale(st['daily_try_at'], DAILY_RETRY * backoff):
+            with self.lock:
+                self.state['daily_try_at'] = datetime.datetime.now()
+            bars = fetch_history(self.symbol_map.values(), '3mo', '1d')
+            if bars:
+                streaks = {}
+                for code, sym in self.symbol_map.items():
+                    sub = bars.get(sym)
+                    if sub is not None and 'Close' in sub.columns:
+                        streaks[code] = close_streak(sub['Close'], mkt_open)
+                with self.lock:
+                    self.state['daily'] = {'at': datetime.datetime.now(), 'open': mkt_open}
+                    self.state['streaks'] = streaks
 
         _, period, interval, ttl = RANGES[rkey]
         entry = st['hist'].get(rkey)
@@ -497,7 +547,8 @@ def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
     ykeys = f'\\[l] log \\[%] %ret [dim]({_YMODE_TAG[y_mode]})[/dim]'
 
     if page == 0:
-        table, n_unpriced, frozen = build_live_table(portfolio, st['quotes'])
+        table, n_unpriced, frozen = build_live_table(portfolio, st['quotes'],
+                                                     streaks=st.get('streaks'))
         notes = []
         # Only after a fetch has actually landed — before that every holding is
         # "unpriced" simply because the first cycle hasn't returned yet, and the
@@ -511,12 +562,15 @@ def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
         if entry and entry['n_flat']:
             notes.append(f"⚠ {entry['n_flat']} holding(s) shown at last close "
                          f"(no bars at this interval)")
-        # Reserve a row per note so the chart shrinks instead of scrolling them off.
-        chart_h = max(H - len(portfolio) - 16 - len(notes), 8)
+        # Reserve a row per note (and one for the legend) so the chart shrinks
+        # instead of scrolling them off.
+        chart_h = max(H - len(portfolio) - 17 - len(notes), 8)
         parts.append(candle_renderable(entry['total'], f'Total Portfolio — {label}',
                                        w, chart_h, hline=total_cost, y_mode=y_mode)
                      if entry is not None else Text('fetching…', style='dim'))
         parts.insert(1, table)
+        parts.insert(2, Text('Streak = straight closed sessions up (+) / down (−) · '
+                             'Run% = total move since that run began', style='dim'))
         for note in notes:
             parts.append(Text(note, style='yellow'))
         keybar = f'[dim]\\[1-7] range  \\[n/p ←/→] page  {ykeys}  \\[q] back[/dim]'

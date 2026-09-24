@@ -426,6 +426,44 @@ def compute_positions(portfolio, quotes, market_open=None):
     return {'rows': rows, 'total': total, 'n_unpriced': n_unpriced, 'frozen': frozen}
 
 
+def close_streak(closes, market_open=None, today=None):
+    """Trailing run of same-direction daily closes → {'run': int, 'pct': float}, or None.
+
+    run is signed: +3 = three straight higher closes, -2 = two straight lower,
+    0 = the newest close was flat against the one before (a flat day resets).
+    pct is the total move over that run, from the close just BEFORE it began
+    to the newest close, in percent.
+
+    Only closed sessions count. While the market is open Yahoo's daily frame
+    carries today's in-progress bar; it is dropped here because it can still
+    flip before 13:30 — today's live move is already on the board as Chg%.
+    Returns None when fewer than two closes remain (nothing to compare).
+    """
+    if market_open is None:
+        market_open = taiwan_market_open()
+    s = pd.Series(closes).dropna()
+    if market_open and len(s):
+        today = today or datetime.datetime.now(ZoneInfo('Asia/Taipei')).date()
+        last = s.index[-1]
+        if (last.date() if hasattr(last, 'date') else last) == today:
+            s = s.iloc[:-1]
+    if len(s) < 2:
+        return None
+    vals = s.tolist()
+    diffs = [b - a for a, b in zip(vals, vals[1:])]
+    if diffs[-1] == 0:
+        return {'run': 0, 'pct': 0.0}
+    up = diffs[-1] > 0
+    run = 0
+    for d in reversed(diffs):
+        if d == 0 or (d > 0) != up:
+            break
+        run += 1
+    start = vals[-1 - run]
+    pct = (vals[-1] / start - 1.0) * 100 if start else 0.0
+    return {'run': run if up else -run, 'pct': pct}
+
+
 
 # ------------------------------------------------------------------
 # Market data: history, indices, technicals, official close, fundamentals
