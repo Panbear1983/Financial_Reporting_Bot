@@ -23,68 +23,23 @@ import numpy as np
 import pandas as pd
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-from market_data_fetcher import TWSDDataSource
-from custom_stock_lookup import get_yfinance_data
+# Every number in this file comes from the dashboard. This module renders and
+# sends; it does not fetch and it does not calculate. See dashboard.py's header.
+import dashboard
+import report_voice
+from dashboard import (DATA_DIR, SCRIPT_DIR, format_zhang, _attach_signals, _config_path, _now,
+                       _twse_row_from_yfinance, compute_positions, fetch_brave_news,
+                       fetch_global_indices, fetch_live_quotes, fetch_margin,
+                       fetch_period_returns, fetch_prev_closes, fetch_stock_technicals,
+                       fetch_taiex, fetch_tpex_all, fetch_tpex_emerging, fetch_twse_all,
+                       fetch_valuation, fetch_yfinance_stock, load_bot_config,
+                       load_portfolio, load_tracked_notes, load_tracked_stocks,
+                       parse_twse_valid, prefetch_stock_histories, resolve_symbols,
+                       taiwan_market_open)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR   = os.getenv('OPENCLAW_DATA_DIR', os.path.join(SCRIPT_DIR, 'data'))
-
-def _config_path(filename):
-    """Prefer data-dir (persistent volume) over script-dir (image layer)."""
-    data_path = os.path.join(DATA_DIR, filename)
-    if os.path.exists(data_path):
-        return data_path
-    return os.path.join(SCRIPT_DIR, filename)
-
-
-def load_tracked_stocks():
-    path = _config_path('tracked_stocks.json')
-    with open(path, 'r', encoding='utf-8') as f:
-        raw = json.load(f)
-    # Values may be a plain name (legacy) or {"name": ..., "note": ...}.
-    # The report only needs the display name, so normalise to {code: name}.
-    return {
-        code: (val.get('name', code) if isinstance(val, dict) else val)
-        for code, val in raw.items()
-    }
-
-
-def load_tracked_notes():
-    """Return {code: note} for watchlist entries that carry a user note.
-
-    Legacy string entries have no note and are omitted. Used by the closing
-    report to surface the note under each watchlist line.
-    """
-    path = _config_path('tracked_stocks.json')
-    with open(path, 'r', encoding='utf-8') as f:
-        raw = json.load(f)
-    return {
-        code: val['note']
-        for code, val in raw.items()
-        if isinstance(val, dict) and val.get('note')
-    }
-
-
-def load_portfolio():
-    path = _config_path('portfolio.json')
-    if not os.path.exists(path):
-        return {}
-    with open(path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    # Drop entries with zero shares so they're treated as untracked
-    return {code: pos for code, pos in data.items() if pos.get('shares', 0) > 0}
-
-
-def load_bot_config():
-    path = _config_path('bot_config.json')
-    if not os.path.exists(path):
-        return {}
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
 
 
 def _resolve_section_order(cfg_order, default_order):
@@ -158,7 +113,7 @@ def _render_sandbox(text):
     chunks     = _line_safe_chunks(text)
     total      = len(chunks)
     timestamp  = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    data_dir   = os.getenv('OPENCLAW_DATA_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
+    data_dir   = os.getenv('FRB_DATA_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
     os.makedirs(data_dir, exist_ok=True)
     fname      = f"sandbox_preview_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     fpath      = os.path.join(data_dir, fname)
@@ -226,28 +181,42 @@ def send_telegram_report(text):
 
 
 def _send_telegram(token, chat_id, text):
-    """Send one report to one Telegram destination (chunked at 4000). Returns bool."""
+    """Send one report to one Telegram destination (chunked at line boundaries,
+    ≤4000 chars). Returns bool."""
     if not token or not chat_id:
         print(f"[{_now()}] Telegram destination missing token/chat_id, skipping.")
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     ok_all = True
-    for chunk in [text[i:i + 4000] for i in range(0, len(text), 4000)]:
+    # Split on line boundaries (not raw 4000-char slices) so a Markdown entity
+    # like **bold** is never cut in half across a chunk boundary — that split was
+    # what produced Telegram's "can't parse entities" 400 and dropped a chunk.
+    for chunk in _line_safe_chunks(text, limit=4000):
+        # Two payloads: formatted first, then a plain-text fallback. If Markdown
+        # parsing still fails on a chunk, resend it without parse_mode so the
+        # content always reaches the channel instead of being silently dropped.
+        payloads = (
+            {"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"},
+            {"chat_id": chat_id, "text": chunk},
+        )
+        payload_i = 0
         # Retry transient failures (e.g. brief "Network is unreachable" blips) so a
         # single dropped chunk doesn't silently deliver half a report.
         sent = False
         for attempt, delay in ((1, 2), (2, 5), (3, 0)):
             try:
-                resp = requests.post(
-                    url, json={"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"},
-                    timeout=15)
+                resp = requests.post(url, json=payloads[payload_i], timeout=15)
                 if resp.ok:
                     print(f"[{_now()}] Telegram sent → {chat_id}.")
                     sent = True
                     break
                 print(f"[{_now()}] Telegram failed ({chat_id}, attempt {attempt}): {resp.text}")
+                if (resp.status_code == 400 and payload_i == 0
+                        and "parse entities" in resp.text):
+                    payload_i = 1   # drop Markdown, resend same chunk as plain text
+                    continue        # immediate retry, no backoff
                 if resp.status_code < 500:
-                    break  # 4xx won't heal on retry (bad markup, bad chat, rate-limit body)
+                    break  # other 4xx won't heal on retry (bad chat, rate-limit body)
             except Exception as e:
                 print(f"[{_now()}] Telegram error ({chat_id}, attempt {attempt}): {e}")
             if delay:
@@ -270,37 +239,40 @@ def deliver_report(text, cfg=None):
         return
     if cfg is None:
         cfg = load_bot_config()
+
     channels = [c for c in (cfg.get('delivery', {}) or {}).get('channels', []) if c.get('enabled', True)]
+    voice_targets = []
     if not channels:
-        _send_telegram(os.getenv('TELEGRAM_BOT_TOKEN'), os.getenv('TELEGRAM_CHAT_ID'), text)
+        token, chat_id = os.getenv('TELEGRAM_BOT_TOKEN'), os.getenv('TELEGRAM_CHAT_ID')
+        _send_telegram(token, chat_id, text)
+        voice_targets.append((token, chat_id))
+    else:
+        for ch in channels:
+            ctype = (ch.get('type') or 'telegram').lower()
+            name  = ch.get('name', ctype)
+            if ctype == 'telegram':
+                token   = os.getenv(ch.get('token_env', 'TELEGRAM_BOT_TOKEN')) or os.getenv('TELEGRAM_BOT_TOKEN')
+                chat_id = ch.get('chat_id') or os.getenv('TELEGRAM_CHAT_ID')
+                _send_telegram(token, chat_id, text)
+                if ch.get('voice', True):
+                    voice_targets.append((token, chat_id))
+            else:
+                print(f"[{_now()}] Channel '{name}' (type={ctype}) configured but OpenClaw has no "
+                      f"{ctype} gateway yet — skipped, not sent.")
+
+    # STRICTLY AFTER the text. Synthesis is a slow network round-trip (minutes for a
+    # long report), so rendering first would delay the report itself — and a voice
+    # failure must never cost a delivered push. Rendered once, shared by all targets.
+    if not voice_targets:
         return
-    for ch in channels:
-        ctype = (ch.get('type') or 'telegram').lower()
-        name  = ch.get('name', ctype)
-        if ctype == 'telegram':
-            token   = os.getenv(ch.get('token_env', 'TELEGRAM_BOT_TOKEN')) or os.getenv('TELEGRAM_BOT_TOKEN')
-            chat_id = ch.get('chat_id') or os.getenv('TELEGRAM_CHAT_ID')
-            _send_telegram(token, chat_id, text)
-        else:
-            print(f"[{_now()}] Channel '{name}' (type={ctype}) configured but OpenClaw has no "
-                  f"{ctype} gateway yet — skipped, not sent.")
+    voice_data = report_voice.render(text, cfg)
+    for token, chat_id in voice_targets:
+        report_voice.send(token, chat_id, voice_data)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _now():
-    return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-
-def format_zhang(volume):
-    """Convert raw share volume (int or comma-string) to 張 string."""
-    try:
-        vol = int(str(volume).replace(',', ''))
-        return f"{vol // 1000:,}"
-    except:
-        return str(volume)
 
 
 def get_market_sentiment(pct):
@@ -312,252 +284,27 @@ def get_market_sentiment(pct):
 
 
 # ---------------------------------------------------------------------------
-# Scrapers — numbers only, no AI
+# Yahoo batch / cache layer
+#
+# The urllib chart endpoint used by custom_stock_lookup.get_yfinance_data is
+# hard rate-limited (HTTP 429) on this host, while the yfinance library path
+# (curl_cffi browser-impersonating session) is not. A report used to fire ~4
+# indices + TAIEX + ~30×(quote + technicals + period-returns) individual calls
+# and trip 429, blanking data. This layer collapses that into a couple of
+# batched yf.download() calls and reuses the results from an in-run cache, so
+# the same symbol is never fetched twice. It also resolves each code's
+# .TW/.TWO suffix from ticker_suffix_cache.json (extending it) instead of
+# always trying .TW first and eating a 404.
 # ---------------------------------------------------------------------------
 
-def fetch_taiex():
-    """TAIEX from yfinance. Returns dict or None."""
-    try:
-        hist = yf.Ticker('^TWII').history(period='3d')
-        if len(hist) < 2:
-            return None
-        today = hist.iloc[-1]
-        prev  = hist.iloc[-2]
-        close = float(today['Close'])
-        change = close - float(prev['Close'])
-        pct    = change / float(prev['Close']) * 100
-        return {
-            'close':  close,
-            'open':   float(today['Open']),
-            'change': change,
-            'pct':    pct,
-        }
-    except Exception as e:
-        print(f"[{_now()}] TAIEX fetch error: {e}")
-        return None
+
+def _suffix_cache_path():
+    return os.path.join(DATA_DIR, 'ticker_suffix_cache.json')
 
 
-def fetch_global_indices(indices=None):
-    """Returns list of formatted strings — scraped from Yahoo Finance."""
-    if not indices:
-        indices = [
-            ('S&P 500',    '^GSPC'),
-            ('Nasdaq',     '^IXIC'),
-            ('費城半導體', '^SOX'),
-            ('日經225',    '^N225'),
-        ]
-    lines = []
-    for name, sym in indices:
-        d = get_yfinance_data(sym)
-        if d:
-            pct = d['change'] / d['prev_close'] * 100
-            lines.append(f"• {name}：{d['price']:,.2f} ({pct:+.2f}%)")
-        else:
-            lines.append(f"• {name}：資料暫時無法取得")
-    return lines
-
-
-def _ticker_history(code, period='20d'):
-    """Fetch yfinance history, trying .TW (TWSE) then .TWO (TPEX/上櫃)."""
-    for suffix in ('.TW', '.TWO'):
-        hist = yf.Ticker(f"{code}{suffix}").history(period=period)
-        if not hist.empty:
-            return hist
-    return pd.DataFrame()
-
-
-def fetch_stock_technicals(code, opening_mode=False, period_days=20):
-    """RSI-14 and 量比. opening_mode=True skips today's partial volume bar.
-    Returns (rsi, vol_ratio) or (None, None)."""
-    try:
-        hist = _ticker_history(code, period=f'{period_days}d')
-        if len(hist) < 15:
-            return None, None
-        closes = hist['Close']
-        delta  = closes.diff()
-
-        # Flat-price edge case: all deltas are zero → RSI ≈ 50
-        if delta.abs().sum() == 0:
-            rsi = 50.0
-        else:
-            gain = delta.clip(lower=0).rolling(14).mean()
-            loss = (-delta.clip(upper=0)).rolling(14).mean()
-            rs   = gain / loss
-            rsi  = float((100 - 100 / (1 + rs)).iloc[-1])
-            if np.isnan(rsi) or np.isinf(rsi):
-                return None, None
-
-        volumes = hist['Volume']
-        if opening_mode:
-            # At market open, today's volume is near-zero — use yesterday's completed bar
-            ref_vol = float(volumes.iloc[-2]) if len(volumes) >= 2 else None
-            avg_vol = float(volumes.iloc[:-2].mean()) if len(volumes) >= 3 else None
-        else:
-            ref_vol = float(volumes.iloc[-1])
-            avg_vol = float(volumes.iloc[:-1].mean()) if len(volumes) >= 2 else None
-
-        if avg_vol and avg_vol > 0 and ref_vol is not None:
-            vol_ratio = round(ref_vol / avg_vol, 2)
-        else:
-            vol_ratio = None
-
-        return round(rsi, 1), vol_ratio
-    except Exception as e:
-        print(f"[{_now()}] Technicals error {code}: {e}")
-        return None, None
-
-
-def fetch_yfinance_stock(code):
-    """Live price data for a single Taiwan stock. Tries .TW then .TWO."""
-    for suffix in ('.TW', '.TWO'):
-        d = get_yfinance_data(f"{code}{suffix}")
-        if d:
-            return d
-    return None
-
-
-def fetch_twse_all():
-    """Full TWSE scan. Returns list of stock dicts or None."""
-    try:
-        result = TWSDDataSource().fetch_data()
-        data   = result['data']
-        date   = data[0].get('Date', '') if data else ''
-        print(f"[{_now()}] TWSE data date: {date} ({len(data)} stocks)")
-        return data
-    except Exception as e:
-        print(f"[{_now()}] TWSE fetch failed: {e}")
-        return None
-
-
-def fetch_tpex_all():
-    """TPEX (上櫃) daily data, normalized to match TWSE field names."""
-    try:
-        resp = requests.get(
-            'https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes',
-            headers={'User-Agent': 'Mozilla/5.0'},
-            timeout=15,
-        )
-        raw = resp.json()
-        normalized = [{
-            'Code':         s.get('SecuritiesCompanyCode', ''),
-            'Name':         s.get('CompanyName', ''),
-            'Date':         s.get('Date', ''),
-            'OpeningPrice': s.get('Open', '0'),
-            'ClosingPrice': s.get('Close', '0'),
-            'Change':       s.get('Change', '0').strip(),
-            'TradeVolume':  s.get('TradingShares', '0'),
-        } for s in raw]
-        date = normalized[0]['Date'] if normalized else ''
-        print(f"[{_now()}] TPEX data date: {date} ({len(normalized)} stocks)")
-        return normalized
-    except Exception as e:
-        print(f"[{_now()}] TPEX fetch failed: {e}")
-        return []
-
-
-def fetch_valuation():
-    """{code: {'pe','yield','pb'}} valuation from TWSE BWIBBU_ALL. Best-effort → {}."""
-    def _f(v):
-        try:
-            return float(str(v).replace(',', '').strip())
-        except (TypeError, ValueError):
-            return None
-    out = {}
-    try:
-        r = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL',
-                         headers={'User-Agent': 'Mozilla/5.0'}, timeout=15, verify=False)
-        for s in r.json():
-            code = (s.get('Code') or '').strip()
-            if code:
-                out[code] = {'pe': _f(s.get('PEratio')), 'yield': _f(s.get('DividendYield')),
-                             'pb': _f(s.get('PBratio'))}
-        print(f"[{_now()}] Valuation (P/E, 殖利率, P/B): {len(out)} stocks")
-    except Exception as e:
-        print(f"[{_now()}] Valuation fetch failed: {e}")
-    return out
-
-
-def fetch_margin():
-    """{code: {'bal','chg'}} 融資今日餘額(張) + day-change from TWSE MI_MARGN. Best-effort → {}."""
-    def _i(v):
-        try:
-            return int(str(v).replace(',', '').strip())
-        except (TypeError, ValueError):
-            return None
-    out = {}
-    try:
-        r = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/MI_MARGN',
-                         headers={'User-Agent': 'Mozilla/5.0'}, timeout=20, verify=False)
-        for s in r.json():
-            code = (s.get('股票代號') or '').strip()
-            if not code:
-                continue
-            bal, prev = _i(s.get('融資今日餘額')), _i(s.get('融資前日餘額'))
-            chg = (bal - prev) if (bal is not None and prev is not None) else None
-            out[code] = {'bal': bal, 'chg': chg}
-        print(f"[{_now()}] Margin (融資餘額): {len(out)} stocks")
-    except Exception as e:
-        print(f"[{_now()}] Margin fetch failed: {e}")
-    return out
-
-
-def _attach_signals(contexts, valuation, margin):
-    """Attach fundamental signals (valuation + margin) onto each per-stock context in place."""
-    for c in contexts:
-        v = valuation.get(c['code']) or {}
-        m = margin.get(c['code']) or {}
-        c['val'] = {'pe': v.get('pe'), 'yield': v.get('yield'), 'pb': v.get('pb'),
-                    'margin_chg': m.get('chg')}
-
-
-def parse_twse_valid(all_stocks):
-    """Attach computed floats to each TWSE stock dict. Returns list of enhanced dicts."""
-    valid = []
-    for s in all_stocks:
-        try:
-            change = float(s.get('Change', '0').replace(',', '').strip() or '0')
-            close  = float(s.get('ClosingPrice', '0').replace(',', '').strip() or '0')
-            vol    = int(s.get('TradeVolume', '0').replace(',', '').strip() or '0')
-            prev   = close - change
-            pct    = change / prev * 100 if prev else 0.0
-            s = dict(s)
-            s['_change'] = change
-            s['_close']  = close
-            s['_vol']    = vol
-            s['_pct']    = pct
-            valid.append(s)
-        except (ValueError, ZeroDivisionError):
-            continue
-    return valid
-
-
-def fetch_period_returns(code):
-    """1M / 3M / 1Y price returns (%) for a watchlist stock, from a single yfinance
-    history call (reuses _ticker_history → .TW then .TWO). Returns
-    {'1月': pct|None, '3月': pct|None, '1年': pct|None}; a window is None when the stock
-    lacks enough history (newly listed / 興櫃). Each window aligns to the nearest trading
-    day on or before the cutoff, so holidays/weekends don't skew it."""
-    try:
-        hist = _ticker_history(code, period='1y')
-        if hist is None or hist.empty:
-            return {}
-        closes = hist['Close'].dropna()
-        if len(closes) < 2:
-            return {}
-        cur       = float(closes.iloc[-1])
-        last_date = closes.index[-1]
-        out = {}
-        for label, days in (('1月', 30), ('3月', 90), ('1年', 365)):
-            prior = closes[closes.index <= last_date - pd.Timedelta(days=days)]
-            if len(prior) == 0 or not cur:
-                out[label] = None
-            else:
-                ref = float(prior.iloc[-1])
-                out[label] = ((cur - ref) / ref * 100) if ref else None
-        return out
-    except Exception as e:
-        print(f"[{_now()}] Period-returns error {code}: {e}")
-        return {}
+# ---------------------------------------------------------------------------
+# Scrapers — numbers only, no AI
+# ---------------------------------------------------------------------------
 
 
 RETURN_FLAG_PCT = 500.0  # |return| beyond this gets a ⚠ verify-flag
@@ -583,40 +330,26 @@ def _returns_line(code, rets=None):
     return "\n  績效：" + " · ".join(parts)
 
 
-def _twse_row_from_yfinance(code):
-    """Closing-report fallback for codes missing from the bulk TWSE/TPEX feeds.
-
-    The closing report's twse_by_code comes from fetch_twse_all (STOCK_DAY_ALL,
-    listed board) + fetch_tpex_all (TPEX 上櫃). Stocks not on either — e.g.
-    emerging-board 興櫃 codes like 3595 山太士 — would otherwise render as
-    "今日無交易數據". This builds a TWSE-row-shaped dict from the same per-code
-    yfinance source the morning report uses (.TW then .TWO), so the existing
-    closing render works unchanged. Returns None if yfinance also has no data.
-    """
-    d = fetch_yfinance_stock(code)
-    if not d:
-        return None
-    price  = d['price']
-    prev   = d['prev_close']
-    change = d.get('change', price - prev)
-    pct    = (change / prev * 100) if prev else 0.0
-    return {
-        'Code': code,
-        'OpeningPrice': f"{d.get('today_open', prev):.2f}",
-        'ClosingPrice': f"{price:.2f}",
-        'TradeVolume': '0',        # yfinance chart feed carries no share volume
-        '_change': change,
-        '_close': price,
-        '_pct': pct,
-        '_vol': 0,
-        '_fallback': 'yfinance',   # source marker (yfinance, not TWSE official)
-    }
+def _chg_text(close, change):
+    """'昨收 335.00，漲 10.0元 / +2.99%' — the day change is measured against the
+    PREVIOUS CLOSE, not the open, so the reference has to be on the line. Without it
+    a row like 開盤 543 → 收盤 538 (漲 11.0元) reads as self-contradictory.
+    Sub-dollar moves keep 2dp so a 0.02元 ETF tick isn't printed as 0.0元."""
+    prev = close - change
+    pct  = (change / prev * 100) if prev else 0.0
+    dp   = 1 if abs(change) >= 1 else 2
+    return (f"昨收 {prev:,.2f}，{'漲' if change >= 0 else '跌'} "
+            f"{abs(change):,.{dp}f}元 / {pct:+.2f}%")
 
 
 def _src_tag(row):
-    """Inline marker for closing lines sourced via the yfinance fallback rather than
-    TWSE official data — signals the reader the volume figure is not an official 量."""
-    return "（yfinance 報價）" if row.get('_fallback') else ""
+    """Inline source marker for closing lines not sourced from TWSE/TPEX mainboard
+    official close: 興櫃均價 for the emerging board (加權平均價, no true 開/收 or 量
+    convention), 或 yfinance 報價 for the Yahoo fallback (volume is not an official 量)."""
+    fb = row.get('_fallback')
+    if fb == 'tpex_esb':
+        return "（興櫃均價）"
+    return "（yfinance 報價）" if fb else ""
 
 
 # ---------------------------------------------------------------------------
@@ -672,9 +405,10 @@ def ai_report_summary(report_text, cfg, digest='', history=''):
     temperature = ai_cfg.get('summary_temperature', 0.3)
     system = (
         "你是一位嚴謹的台股分析師。只根據所提供的『當日客觀數據』、『近期走勢』與報告內容進行分析，"
-        "不得臆測使用者的選股理由或動機（報告不含使用者備註）。對觀察清單，"
-        "請依當日價格動作、技術指標（RSI／量比／乖離）與 1月／3月／1年 報酬給出判斷，"
+        "不得臆測使用者的選股理由或動機（報告不含使用者備註）。分析聚焦於大盤與持倉個股，"
+        "依當日價格動作、技術指標（RSI／量比／乖離）、融資與 1月／3月／1年 報酬給出判斷，"
         "並可參考近期走勢指出趨勢與連續性（如連續數日漲跌、與昨日比較），但結論仍以當日數據為主。"
+        "不需分析觀察清單。"
     )
     parts = []
     if digest:
@@ -687,9 +421,10 @@ def ai_report_summary(report_text, cfg, digest='', history=''):
     )
     parts.append(
         "請撰寫「報告總結」（繁體中文，精簡條列）：\n"
-        "1. 今日重點與持倉整體狀況（可對比近期走勢指出趨勢）；\n"
-        "2. 【觀察清單】逐檔給出 值得關注／觀望／回避 的判斷，並以當日數據佐證（可引用關鍵數字、點出連續性）；\n"
-        "3. 需留意的風險。"
+        "1. 大盤與市場概況（可對比全球市場與近期走勢指出趨勢）；\n"
+        "2. 持倉個股逐檔重點與整體狀況（引用當日 RSI／量比／融資／報酬與連續性佐證）；\n"
+        "3. 需留意的風險。\n"
+        "僅分析大盤與持倉，不要納入觀察清單。"
     )
     prompt = "\n\n".join(parts)
     try:
@@ -698,29 +433,6 @@ def ai_report_summary(report_text, cfg, digest='', history=''):
     except Exception as e:
         print(f"[{_now()}] Report-summary error: {e}")
         return ''
-
-
-def fetch_brave_news(query='台股 今日 財經', count=5):
-    """Fetch latest financial news headlines via Brave Search API."""
-    api_key = os.getenv('BRAVE_API_KEY')
-    if not api_key:
-        return []
-    try:
-        resp = requests.get(
-            'https://api.search.brave.com/res/v1/web/search',
-            headers={
-                'X-Subscription-Token': api_key,
-                'Accept': 'application/json',
-            },
-            params={'q': query, 'count': count, 'search_lang': 'zh-hant', 'freshness': 'pd'},
-            timeout=10,
-        )
-        if resp.ok:
-            results = resp.json().get('web', {}).get('results', [])
-            return [r.get('title', '') for r in results if r.get('title')]
-    except Exception as e:
-        print(f"[{_now()}] Brave Search error: {e}")
-    return []
 
 
 def ai_stock_reason(name, code, open_p, close_p, change, pct, rsi, vol_ratio, zhang, taiex_pct,
@@ -766,7 +478,11 @@ def ai_stock_reasons_batch(contexts, taiex_pct, cfg):
         return {}
     ai_cfg = cfg.get('ai', {})
     model  = ai_cfg.get('model', 'anthropic/claude-haiku-3-5')
-    max_tokens = min(45 * len(contexts) + 120, 2000)
+    # Honour the TUI's per-stock 個股原因 token budget (was hardcoded 45/stock, which
+    # ignored ai.max_tokens_reason). Scales with stock count; capped so a large
+    # watchlist can't run away. Default matches the TUI's displayed default (100).
+    per_stock  = int(ai_cfg.get('max_tokens_reason', 100) or 100)
+    max_tokens = min(per_stock * len(contexts) + 120, 4000)
     rows = []
     for c in contexts:
         direction = '漲' if c.get('change', 0) >= 0 else '跌'
@@ -841,79 +557,36 @@ def ai_closing_commentary(taiex_pct, global_lines, top_vol, top_losers,
 # ---------------------------------------------------------------------------
 
 def generate_morning_report():
-    tracked       = load_tracked_stocks()   # {"2330": "台積電", ...}
-    tracked_notes = load_tracked_notes()
-    portfolio = load_portfolio()        # {"2330": {"shares": N, "avg_cost": X}, ...}
-    date_str  = datetime.datetime.now().strftime('%Y-%m-%d')
-    time_str  = datetime.datetime.now().strftime('%H:%M')
-    output_dir = os.getenv('OPENCLAW_DATA_DIR', '/app/data')
-
-    cfg            = load_bot_config()
-    technicals_cfg = cfg.get('technicals', {})
+    # ── Everything below is the dashboard's. This function renders; it does not
+    # fetch and it does not calculate. One call, one set of numbers. ──
+    snap = dashboard.snapshot('morning')
+    cfg            = snap['cfg']
+    tracked_notes  = snap['tracked_notes']
+    portfolio      = snap['portfolio']
+    date_str, time_str = snap['date_str'], snap['time_str']
+    output_dir     = DATA_DIR
     ai_cfg         = cfg.get('ai', {})
+    technicals_cfg = cfg.get('technicals', {})
     sections       = cfg.get('sections', {}).get('morning', {})
-    period_days    = technicals_cfg.get('period_days', 20)
+    taiex, taiex_pct = snap['taiex'], snap['taiex_pct']
+    global_lines   = snap['global_lines']
+    _calc          = snap['positions']
+    _prev_mismatch = snap['prev_mismatch']
 
-    print(f"[{_now()}] [MORNING] Fetching TAIEX...")
-    taiex = fetch_taiex()
-    taiex_pct = taiex['pct'] if taiex else 0.0
+    hold_ctx, watch_ctx = snap['holdings'], snap['watchlist']
+    holding_sections = [l for code, name in snap['missing_holdings']
+                        for l in (f"• **{name} ({code})**：資料暫時無法取得", "")]
+    watch_sections   = [l for code, name in snap['missing_watch']
+                        for l in (f"• **{name} ({code})**：資料暫時無法取得", "")]
+    holdings_data, watch_data, stock_summary = [], [], []
+    # Straight off the shared calculation — the same totals the board's Total row shows.
+    pf_daily_total = _calc['total']['daily_pnl']
+    pf_gain_total  = _calc['total']['pnl']
+    pf_cost_total  = _calc['total']['cost']
 
-    print(f"[{_now()}] [MORNING] Fetching global indices...")
-    global_lines = fetch_global_indices(cfg.get('global_indices'))
-
-    print(f"[{_now()}] [MORNING] Fetching holdings (yfinance live)...")
-    holding_sections = []
-    holdings_data    = []
-    stock_summary    = []
-    pf_daily_total   = 0.0
-    pf_gain_total    = 0.0
-    pf_cost_total    = 0.0
-
-    _valuation = fetch_valuation()
-    _margin    = fetch_margin()
-
-    # Pass 1 — gather holdings (data only; 展望 comes from one batched call below)
-    hold_ctx = []
-    for code, pos in portfolio.items():
-        name = pos.get('name', code)
-        d = fetch_yfinance_stock(code)
-        rsi, vol_ratio = fetch_stock_technicals(code, opening_mode=True, period_days=period_days)
-        if d:
-            price, prev_cls, change = d['price'], d['prev_close'], d['change']
-            pct = change / prev_cls * 100 if prev_cls else 0.0
-            hold_ctx.append({
-                'code': code, 'name': name, 'pos': pos,
-                'price': price, 'prev_cls': prev_cls, 'change': change, 'pct': pct,
-                'rsi': rsi, 'vol_ratio': vol_ratio, 'zhang': 'N/A',
-            })
-        else:
-            holding_sections.append(f"• **{name} ({code})**：資料暫時無法取得")
-            holding_sections.append("")
-
-    print(f"[{_now()}] [MORNING] Fetching watchlist (yfinance live)...")
-    watch_sections = []
-    watch_data     = []
-    watch_ctx = []
-    for code, name in tracked.items():
-        if code in portfolio:
-            continue
-        d = fetch_yfinance_stock(code)
-        rsi, vol_ratio = fetch_stock_technicals(code, opening_mode=True, period_days=period_days)
-        if d:
-            price, prev_cls, change = d['price'], d['prev_close'], d['change']
-            pct = change / prev_cls * 100 if prev_cls else 0.0
-            watch_ctx.append({
-                'code': code, 'name': name,
-                'price': price, 'prev_cls': prev_cls, 'change': change, 'pct': pct,
-                'rsi': rsi, 'vol_ratio': vol_ratio, 'zhang': 'N/A',
-                'rets': fetch_period_returns(code), 'note': tracked_notes.get(code, ''),
-            })
-        else:
-            watch_sections.append(f"• **{name} ({code})**：資料暫時無法取得")
-            watch_sections.append("")
-
-    # One batched AI call for every 展望 (holdings + watchlist) — cross-stock aware
-    _attach_signals(hold_ctx + watch_ctx, _valuation, _margin)
+    # One batched AI call for every 展望 (holdings + watchlist) — cross-stock aware.
+    # Its only inputs are the dashboard's numbers: the analysis reasons about
+    # what the board shows, never about data fetched behind the board's back.
     print(f"[{_now()}] [MORNING] AI 展望 (batched, {len(hold_ctx) + len(watch_ctx)} stocks)...")
     _reasons = ai_stock_reasons_batch(hold_ctx + watch_ctx, taiex_pct, cfg)
 
@@ -927,14 +600,6 @@ def generate_morning_report():
             f"• **{name} ({code})**：目前 {price:,.1f}元"
             f" [昨收 {prev_cls:,.1f} | {direction}{abs(change):.1f}元 ({pct:+.2f}%)]"
         )
-        try:
-            pf_line = format_portfolio_line(c['pos']['shares'], c['pos']['cost_basis'], price)
-            line += '\n' + pf_line
-            pf_daily_total += c['pos']['shares'] * change
-            pf_gain_total  += c['pos']['shares'] * price - c['pos']['cost_basis']
-            pf_cost_total  += c['pos']['cost_basis']
-        except (ValueError, TypeError, KeyError):
-            pass
         if reason:
             line += f"\n  展望：{reason}"
         line += _stock_note(cfg, code)
@@ -983,6 +648,12 @@ def generate_morning_report():
             f"💰 今日持倉：今日損益 {d_sign}{pf_daily_total:,.0f}元"
             f" | 持倉總損益 {t_sign}{pf_gain_total:,.0f}元 ({pf_total_pct:+.1f}%)"
         )
+        # A partial total must never read as the market moving.
+        if _calc['n_unpriced']:
+            pf_summary += (f"\n⚠️ 僅含 {_calc['total']['n_priced']}/{_calc['total']['n_total']} "
+                           f"檔（其餘無報價，未計入）")
+        if _prev_mismatch:
+            pf_summary += f"\n⚠️ 昨收與交易所紀錄不符：{'、'.join(_prev_mismatch)}"
 
     # Assemble — build each section block, then emit in the configured order
     blocks = {}
@@ -1077,105 +748,43 @@ def generate_morning_report():
 # ---------------------------------------------------------------------------
 
 def generate_closing_report():
-    tracked       = load_tracked_stocks()
-    tracked_notes = load_tracked_notes()
-    portfolio  = load_portfolio()
-    date_str   = datetime.datetime.now().strftime('%Y-%m-%d')
-    time_str   = datetime.datetime.now().strftime('%H:%M')
-    output_dir = os.getenv('OPENCLAW_DATA_DIR', '/app/data')
-
-    cfg            = load_bot_config()
-    technicals_cfg = cfg.get('technicals', {})
-    ai_cfg         = cfg.get('ai', {})
-    news_cfg       = cfg.get('news', {})
-    sections       = cfg.get('sections', {}).get('closing', {})
-    period_days    = technicals_cfg.get('period_days', 20)
-
-    print(f"[{_now()}] [CLOSING] Fetching TAIEX...")
-    taiex = fetch_taiex()
-    taiex_pct = taiex['pct'] if taiex else 0.0
-
-    print(f"[{_now()}] [CLOSING] Fetching global indices...")
-    global_lines = fetch_global_indices(cfg.get('global_indices'))
-
-    print(f"[{_now()}] [CLOSING] Fetching TWSE official data...")
-    all_stocks = fetch_twse_all()
-    if not all_stocks:
-        print(f"[{_now()}] TWSE data unavailable — aborting closing report.")
+    # ── Everything below is the dashboard's. This function renders; it does not
+    # fetch and it does not calculate. One call, one set of numbers. ──
+    snap = dashboard.snapshot('closing')
+    if snap is None:
         return None
+    cfg            = snap['cfg']
+    tracked_notes  = snap['tracked_notes']
+    portfolio      = snap['portfolio']
+    date_str, time_str = snap['date_str'], snap['time_str']
+    output_dir     = DATA_DIR
+    ai_cfg         = cfg.get('ai', {})
+    technicals_cfg = cfg.get('technicals', {})
+    sections       = cfg.get('sections', {}).get('closing', {})
+    taiex, taiex_pct = snap['taiex'], snap['taiex_pct']
+    global_lines   = snap['global_lines']
+    _calc          = snap['positions']
+    data_is_stale  = snap['is_stale']
+    twse_date_raw  = snap['feed_date']
+    top_volume     = snap['hotlist']['top_volume']
+    top_losers     = snap['hotlist']['top_losers']
+    brave_headlines = snap['news']
 
-    # Check if TWSE data is today's — ROC year = Gregorian - 1911
-    twse_date_raw = all_stocks[0].get('Date', '') if all_stocks else ''
-    today_roc = datetime.datetime.now().strftime(f"{datetime.datetime.now().year - 1911}%m%d")
-    data_is_stale = twse_date_raw != today_roc
+    hold_ctx, watch_ctx = snap['holdings'], snap['watchlist']
+    holding_sections = [l for code, name in snap['missing_holdings']
+                        for l in (f"• **{name} ({code})**：今日無交易數據", "")]
+    watch_sections   = [l for code, name in snap['missing_watch']
+                        for l in (f"• **{name} ({code})**：今日無交易數據", "")]
+    holdings_data, watch_data = [], []
+    # The closing totals now come from the SAME compute_positions() the board and
+    # the morning push use — they used to be re-accumulated here from TWSE rows.
+    pf_daily_total = _calc['total']['daily_pnl']
+    pf_gain_total  = _calc['total']['pnl']
+    pf_cost_total  = _calc['total']['cost']
 
-    valid = parse_twse_valid(all_stocks)
-    twse_by_code = {s['Code']: s for s in valid}
-
-    top_volume = sorted(valid, key=lambda x: x['_vol'], reverse=True)[:5]
-    top_losers = sorted(valid, key=lambda x: x['_pct'])[:5]
-
-    # Merge TPEX (上櫃) data for portfolio stocks not on TWSE main board
-    print(f"[{_now()}] [CLOSING] Fetching TPEX data...")
-    tpex_stocks = fetch_tpex_all()
-    if tpex_stocks:
-        for s in parse_twse_valid(tpex_stocks):
-            if s['Code'] not in twse_by_code:
-                twse_by_code[s['Code']] = s
-
-    print(f"[{_now()}] [CLOSING] Fetching fundamentals (valuation, margin)...")
-    _valuation = fetch_valuation()
-    _margin    = fetch_margin()
-
-    print(f"[{_now()}] [CLOSING] Gathering holdings + watchlist...")
-    holding_sections = []
-    holdings_data    = []
-    pf_daily_total   = 0.0
-    pf_gain_total    = 0.0
-    pf_cost_total    = 0.0
-
-    # Pass 1 — gather holdings (data only; 原因 comes from one batched call below)
-    hold_ctx = []
-    for code, pos in portfolio.items():
-        name = pos.get('name', code)
-        row = twse_by_code.get(code) or _twse_row_from_yfinance(code)
-        if not row:
-            holding_sections.append(f"• **{name} ({code})**：今日無交易數據")
-            holding_sections.append("")
-            continue
-        rsi, vol_ratio = fetch_stock_technicals(code, period_days=period_days)
-        hold_ctx.append({
-            'code': code, 'name': name, 'pos': pos, 'row': row,
-            'open_p': row.get('OpeningPrice', 'N/A'), 'close_p': row.get('ClosingPrice', 'N/A'),
-            'change': row['_change'], 'pct': row['_pct'],
-            'zhang': format_zhang(row.get('TradeVolume', '0')),
-            'rsi': rsi, 'vol_ratio': vol_ratio,
-        })
-
-    # Pass 1 — gather watchlist
-    watch_sections = []
-    watch_data     = []
-    watch_ctx = []
-    for code, name in tracked.items():
-        if code in portfolio:
-            continue
-        row = twse_by_code.get(code) or _twse_row_from_yfinance(code)
-        if not row:
-            watch_sections.append(f"• **{name} ({code})**：今日無交易數據")
-            watch_sections.append("")
-            continue
-        rsi, vol_ratio = fetch_stock_technicals(code, period_days=period_days)
-        watch_ctx.append({
-            'code': code, 'name': name, 'row': row,
-            'open_p': row.get('OpeningPrice', 'N/A'), 'close_p': row.get('ClosingPrice', 'N/A'),
-            'change': row['_change'], 'pct': row['_pct'],
-            'zhang': format_zhang(row.get('TradeVolume', '0')),
-            'rsi': rsi, 'vol_ratio': vol_ratio, 'rets': fetch_period_returns(code),
-            'note': tracked_notes.get(code, ''),
-        })
-
-    # One batched AI call for every 原因 (holdings + watchlist) — cross-stock aware
-    _attach_signals(hold_ctx + watch_ctx, _valuation, _margin)
+    # One batched AI call for every 原因 (holdings + watchlist) — cross-stock aware.
+    # Its only inputs are the dashboard's numbers: the analysis reasons about
+    # what the board shows, never about data fetched behind the board's back.
     print(f"[{_now()}] [CLOSING] AI 原因 (batched, {len(hold_ctx) + len(watch_ctx)} stocks)...")
     _reasons = ai_stock_reasons_batch(hold_ctx + watch_ctx, taiex_pct, cfg)
 
@@ -1185,17 +794,9 @@ def generate_closing_report():
         reason = _reasons.get(code, '')
         line = (
             f"• **{name} ({code})**：[開盤] {c['open_p']}元 → [收盤] {c['close_p']}元"
-            f" ({'漲' if c['change'] >= 0 else '跌'} {abs(c['change']):.1f}元 / {c['pct']:+.2f}%)"
+            f"（{_chg_text(row['_close'], c['change'])}）"
             f" [成交量: {c['zhang']}張]{_src_tag(row)}"
         )
-        try:
-            pf_line = format_portfolio_line(c['pos']['shares'], c['pos']['cost_basis'], row['_close'])
-            line += '\n' + pf_line
-            pf_daily_total += c['pos']['shares'] * c['change']
-            pf_gain_total  += c['pos']['shares'] * row['_close'] - c['pos']['cost_basis']
-            pf_cost_total  += c['pos']['cost_basis']
-        except (ValueError, TypeError, KeyError):
-            pass
         if reason:
             line += f"\n    原因：{reason}"
         line += _stock_note(cfg, code)
@@ -1211,7 +812,7 @@ def generate_closing_report():
         reason = _reasons.get(code, '')
         line = (
             f"• **{name} ({code})**：[開盤] {c['open_p']}元 → [收盤] {c['close_p']}元"
-            f" ({'漲' if c['change'] >= 0 else '跌'} {abs(c['change']):.1f}元 / {c['pct']:+.2f}%)"
+            f"（{_chg_text(row['_close'], c['change'])}）"
             f" [成交量: {c['zhang']}張]{_src_tag(row)}"
         )
         line += _returns_line(code, c['rets'])
@@ -1224,12 +825,6 @@ def generate_closing_report():
         watch_data.append(_stock_row(
             code, name, row.get('_close'), c['change'], c['pct'], c['rsi'], c['vol_ratio'], reason,
             c['note'], returns=c['rets'], valuation=c.get('val')))
-
-    print(f"[{_now()}] [CLOSING] Fetching Brave news headlines...")
-    brave_headlines = fetch_brave_news(
-        query=news_cfg.get('query_closing', '台股 今日 財經 股市'),
-        count=news_cfg.get('count', 5),
-    )
 
     print(f"[{_now()}] [CLOSING] Generating AI market commentary...")
     research, recommend = ai_closing_commentary(
@@ -1267,7 +862,11 @@ def generate_closing_report():
     gm.append("")
     blocks['global_markets'] = gm
 
-    hot = ["🔥 **今日市場熱點掃描：**", "*成交量前五：*"]
+    hot_title = ("🔥 **市場熱點掃描：**" if data_is_stale else "🔥 **今日市場熱點掃描：**")
+    hot = [hot_title]
+    if data_is_stale:
+        hot.append(f"（全市場排行為最近已發布交易日 {twse_date_raw}）")
+    hot.append("*成交量前五：*")
     for s in top_volume:
         hot.append(f"  • {s['Name']} ({s['Code']}): {format_zhang(s['_vol'])}張 ({s['_pct']:+.2f}%)")
     hot.append("")
@@ -1315,7 +914,8 @@ def generate_closing_report():
         lines.append("")
     lines.append(f"📊 {date_str} 台股收盤報告（{time_str} 數據）")
     if data_is_stale:
-        lines.append(f"⚠️ 注意：TWSE尚未發布今日數據，以下為最近交易日（{twse_date_raw}）數據")
+        lines.append(f"⚠️ 注意：TWSE全市場檔尚未發布今日數據（最新為 {twse_date_raw}）。"
+                     f"持倉與觀察清單改用即時報價，熱點排行仍為 {twse_date_raw}。")
     lines.append(f"數據來源：TWSE官方 / 技術指標：Yahoo Finance")
     lines.append("")
     closing_order = cfg.get('sections', {}).get('closing_order')
@@ -1439,9 +1039,8 @@ def _summary_digest(watch_data, holdings_data, scalars, tech_cfg):
             out.append("- " + " ".join(parts))
         return out
 
-    if watch_data:
-        lines.append("觀察清單（當日客觀數據）:")
-        lines.extend(_fmt_rows(watch_data))
+    # Watchlist is intentionally EXCLUDED from the analyst summary (2026-07-08 spec):
+    # the AI analysis covers only the market overview + holding positions.
     if holdings_data:
         lines.append("持倉個股（當日客觀數據）:")
         lines.extend(_fmt_rows(holdings_data))
