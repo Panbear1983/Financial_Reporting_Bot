@@ -65,6 +65,17 @@ def run_report(mode='closing'):
     print(f"TWSE {mode} report executed {status}.", flush=True)
 
 
+def run_streak_alert():
+    """Post-close push naming holdings on a 3+ session run (streak_alert.py)."""
+    if not is_taiwan_weekday():
+        print("Skipping streak alert — weekend in Taiwan.", flush=True)
+        return
+    print(f"Executing streak alert...{_sandbox_label()}", flush=True)
+    result = subprocess.run([sys.executable, 'streak_alert.py'])
+    status = 'successfully' if result.returncode == 0 else f'failed (code {result.returncode})'
+    print(f"Streak alert executed {status}.", flush=True)
+
+
 def _report_exists_today(mode):
     """True if a report for today's UTC date and this mode was already archived."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -78,24 +89,44 @@ def _report_exists_today(mode):
         return False
 
 
-def catch_up_missed(morning_utc, closing_utc):
-    """Run any slot that already passed today without producing a report.
+def _streak_ran_today():
+    """True if streak_alert.py already ran for today's Taipei date (its state file)."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir   = os.getenv('FRB_DATA_DIR', os.path.join(script_dir, 'data'))
+    taipei_today = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%Y-%m-%d')
+    try:
+        with open(os.path.join(data_dir, 'streak_alert_state.json')) as f:
+            return json.load(f).get('last_run') == taipei_today
+    except (FileNotFoundError, ValueError):
+        return False
+
+
+def catch_up_missed(morning_utc, closing_utc, streak_utc):
+    """Run any slot that already passed today without leaving its record.
 
     `schedule` has no catch-up: a restart or clock step past a slot silently
     skips that run until the next day. On startup we backfill once so a missed
-    morning/closing push self-heals. SANDBOX is honoured via run_report().
+    morning/closing push (or streak alert) self-heals. SANDBOX is honoured via
+    run_report() / streak_alert.py.
     """
     now = datetime.datetime.utcnow()
-    for mode, at in (('morning', morning_utc), ('closing', closing_utc)):
+    slots = (
+        ('morning', morning_utc, lambda: _report_exists_today('morning'),
+         lambda: run_report(mode='morning')),
+        ('closing', closing_utc, lambda: _report_exists_today('closing'),
+         lambda: run_report(mode='closing')),
+        ('streak',  streak_utc,  _streak_ran_today, run_streak_alert),
+    )
+    for name, at, done_today, run in slots:
         try:
             hh, mm = map(int, at.split(':'))
         except ValueError:
             continue
         slot = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if now >= slot and is_taiwan_weekday() and not _report_exists_today(mode):
-            print(f"Catch-up: {mode} {at} UTC slot passed with no report today — running now.",
+        if now >= slot and is_taiwan_weekday() and not done_today():
+            print(f"Catch-up: {name} {at} UTC slot passed with nothing recorded today — running now.",
                   flush=True)
-            run_report(mode=mode)
+            run()
 
 
 # ---------------------------------------------------------------------------
@@ -107,11 +138,14 @@ if NOW_MODE:
     print(f"{label} Running {NOW_MODE} report immediately...", flush=True)
     if NOW_MODE in ('morning', 'closing'):
         run_report(mode=NOW_MODE)
+    elif NOW_MODE == 'streak':
+        run_streak_alert()
     elif NOW_MODE == 'all':
         run_report(mode='morning')
         run_report(mode='closing')
+        run_streak_alert()
     else:
-        print(f"Unknown --now mode: {NOW_MODE}. Valid: morning, closing, all", flush=True)
+        print(f"Unknown --now mode: {NOW_MODE}. Valid: morning, closing, streak, all", flush=True)
         sys.exit(1)
     sys.exit(0)
 
@@ -123,9 +157,11 @@ if NOW_MODE:
 # Schedule times loaded from bot_config.json (falls back to hardcoded defaults)
 _morning_utc  = _sched.get('morning_utc',  '01:30')
 _closing_utc  = _sched.get('closing_utc',  '08:00')
+_streak_utc   = _sched.get('streak_utc',   '08:05')   # after the closing report
 
 schedule.every().day.at(_morning_utc).do(run_report, mode='morning')
 schedule.every().day.at(_closing_utc).do(run_report, mode='closing')
+schedule.every().day.at(_streak_utc).do(run_streak_alert)
 
 if SANDBOX:
     print("━" * 55, flush=True)
@@ -136,9 +172,10 @@ if SANDBOX:
 print("Scheduler started. Waiting for next scheduled run...", flush=True)
 print(f"  - TWSE morning:   {_morning_utc} UTC — weekdays, yfinance live", flush=True)
 print(f"  - TWSE closing:   {_closing_utc} UTC — weekdays, TWSE official", flush=True)
+print(f"  - Streak alert:   {_streak_utc} UTC — weekdays, holdings on a 3+ session run", flush=True)
 
 # Backfill a slot we slept through (restart / clock step) so a missed push self-heals.
-catch_up_missed(_morning_utc, _closing_utc)
+catch_up_missed(_morning_utc, _closing_utc, _streak_utc)
 
 while True:
     schedule.run_pending()
