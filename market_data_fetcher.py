@@ -12,12 +12,18 @@ from abc import ABC, abstractmethod
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Configure logging
+# Configure logging.
+# The data folder is FRB_DATA_DIR when set (the launchd scheduler sets it), otherwise
+# this project's own data/ folder, same as dashboard.py and the report scripts.
+# It used to default to /app/data, a path that only existed inside the old Docker
+# container, so opening the Graphs screen from the TUI crashed on this Mac.
+_DATA_DIR = os.getenv('FRB_DATA_DIR') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+os.makedirs(_DATA_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.getenv('FRB_DATA_DIR', '/app/data') + '/market_data.log'),
+        logging.FileHandler(os.path.join(_DATA_DIR, 'market_data.log')),
         logging.StreamHandler()
     ]
 )

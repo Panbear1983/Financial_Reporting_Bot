@@ -194,7 +194,13 @@ def candle_renderable(ohlc_df, title, width, height, hline=None, y_mode='linear'
         else:
             plt.ylim(ylo, yhi)
             plt.title(f'{title}{note}')
-    return Text.from_ansi(plt.build())
+    # plotext sizes the title row by character count, so a CJK title (double-width
+    # cells) makes that one row overrun `width`. Clip every row to `width` so a
+    # full-width chart can never wrap and push the layout down a line.
+    rows = Text.from_ansi(plt.build()).split('\n')
+    for row in rows:
+        row.truncate(width)
+    return Text('\n').join(rows)
 
 
 def _fmt_signed(v, pct=False):
@@ -214,7 +220,9 @@ def build_live_table(portfolio, quotes, market_open=None):
     if market_open is None:
         market_open = taiwan_market_open()
     calc = compute_positions(portfolio, quotes, market_open)
-    t = Table(title='Portfolio Holdings — Live', box=box.ROUNDED)
+    # expand=True: span the full terminal width; Live re-renders 4×/s, so the
+    # table tracks the window as it is resized.
+    t = Table(title='Portfolio Holdings — Live', box=box.ROUNDED, expand=True)
     for col, kw in [('#', dict(style='dim', width=3, justify='right')),
                     ('Code', dict(style='bold cyan', width=8)),
                     ('Name', dict(width=14)),
@@ -483,7 +491,7 @@ def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
                  n_pages, total_cost, search_mode, search_buf, y_mode='linear'):
     entry = st['hist'].get(range_key)
     label = RANGES[range_key][0]
-    w = console.size.width - 4
+    w = console.size.width      # full width, so charts line up with the live table
     H = console.size.height
     parts = [_hero_line(st, label, page, n_pages)]
     ykeys = f'\\[l] log \\[%] %ret [dim]({_YMODE_TAG[y_mode]})[/dim]'

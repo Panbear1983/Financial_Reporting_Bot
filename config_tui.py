@@ -575,7 +575,9 @@ def menu_diary():
 # ---------------------------------------------------------------------------
 
 def _build_portfolio_table(portfolio):
-    t = Table(title='Portfolio Holdings', box=box.ROUNDED, show_lines=True)
+    # expand=True: span the full terminal width (flush left and right) instead of
+    # hugging the content; re-fits to the current width each time it is drawn.
+    t = Table(title='Portfolio Holdings', box=box.ROUNDED, show_lines=True, expand=True)
     t.add_column('#',             style='dim',         width=4,  justify='right')
     t.add_column('Code',          style='bold cyan',   width=8)
     t.add_column('Name',                               width=16)
