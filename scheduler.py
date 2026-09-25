@@ -70,6 +70,11 @@ def is_taiwan_weekday():
     if holiday:
         print(f"Taiwan market closed today — {holiday}.", flush=True)
         return False
+    if holiday is None:
+        # Say so out loud. Falling back to Mon–Fri without a word is exactly how
+        # the 中秋節 report got published in the first place.
+        print("⚠ Holiday calendar unavailable — falling back to the weekday test, "
+              "so a public holiday could slip through today.", flush=True)
     return True
 
 
@@ -193,6 +198,18 @@ if SANDBOX:
     print("━" * 55, flush=True)
 
 print("Scheduler started. Waiting for next scheduled run...", flush=True)
+
+# Pull the holiday calendar down now (and next year's, once TWSE issues it in the
+# autumn) so no job ever has to depend on the exchange being reachable at the
+# moment it fires — least of all the first run after the year turns over.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from dashboard import warm_holiday_cache
+    for _yr, _n in warm_holiday_cache().items():
+        print(f"  - Holidays ROC {_yr}: "
+              + (f"{_n} closed days cached" if _n else "not published yet"), flush=True)
+except Exception as _exc:                                          # noqa: BLE001
+    print(f"  - Holiday calendar warm-up skipped: {type(_exc).__name__}: {_exc}", flush=True)
 print(f"  - TWSE morning:   {_morning_utc} UTC — weekdays, yfinance live", flush=True)
 print(f"  - TWSE closing:   {_closing_utc} UTC — weekdays, TWSE official", flush=True)
 print(f"  - Streak alert:   {_streak_utc} UTC — weekdays, holdings on a 3+ session run", flush=True)

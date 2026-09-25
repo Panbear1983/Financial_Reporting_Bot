@@ -353,11 +353,47 @@ def fetch_live_quotes(codes, symbol_map, daily=None):
 
 
 _HOLIDAY_URL   = 'https://www.twse.com.tw/rwd/zh/holidaySchedule/holidaySchedule'
-_HOLIDAY_CACHE = {}          # ROC year (int) -> {date_str: name}
+_HOLIDAY_CACHE  = {}         # ROC year (int) -> {'days': {date: name}, 'fetched': 'YYYY-MM-DD'}
+_HOLIDAY_TRY_AT = {}         # ROC year (int) -> datetime of the last network attempt
+_HOLIDAY_MAX_AGE_DAYS = 30   # re-ask this often, so mid-year amendments land
+_HOLIDAY_RETRY_SECS   = 3600 # ...but at most this often when the ask is failing
 
 
 def _holiday_cache_path():
     return os.path.join(DATA_DIR, 'market_holidays.json')
+
+
+def _read_holiday_cache():
+    """The on-disk calendar as {'115': {'fetched': 'YYYY-MM-DD', 'days': {...}}}.
+
+    Migrates the first format, which stored the day map directly under the year
+    with no fetch date: those are treated as age-unknown, hence stale, so the
+    first lookup after an upgrade re-asks once and stamps them.
+    """
+    try:
+        with open(_holiday_cache_path(), encoding='utf-8') as f:
+            raw = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+    out = {}
+    for key, val in raw.items():
+        if not key.isdigit() or not isinstance(val, dict):
+            continue                                   # 'fetched_at' and friends
+        if 'days' in val:
+            out[key] = val
+        else:                                          # legacy: bare day map
+            out[key] = {'fetched': None, 'days': val}
+    return out
+
+
+def _stale(fetched):
+    if not fetched:
+        return True
+    try:
+        age = datetime.date.today() - datetime.date.fromisoformat(fetched)
+    except (TypeError, ValueError):
+        return True
+    return age.days >= _HOLIDAY_MAX_AGE_DAYS or age.days < 0
 
 
 def fetch_market_holidays(roc_year, refresh=False):
@@ -369,24 +405,38 @@ def fetch_market_holidays(roc_year, refresh=False):
     published a full report on a closed market, quoting the previous session's
     prices as if they were today's.
 
+    The cached copy is re-asked every _HOLIDAY_MAX_AGE_DAYS, so a year that was
+    unpublished when we first looked (next year's, before TWSE issues it) is
+    picked up without anyone intervening, and a mid-year amendment lands too.
+    A failed re-ask keeps serving the copy we already have.
+
     Returns {} if the calendar has never been fetched and the network fails —
     callers must treat that as "unknown", not as "no holidays", so a failed
     lookup can never silently take the whole schedule offline.
     """
     roc_year = int(roc_year)
-    if not refresh and roc_year in _HOLIDAY_CACHE:
-        return _HOLIDAY_CACHE[roc_year]
+    # 1. A still-fresh answer already in this process settles it without touching
+    #    the disk — taiwan_market_open() runs off this and the live board calls it
+    #    several times a second.
+    mem = _HOLIDAY_CACHE.get(roc_year)
+    if mem and not refresh and not _stale(mem.get('fetched')):
+        return mem['days']
 
-    path, disk = _holiday_cache_path(), {}
-    try:
-        with open(path, encoding='utf-8') as f:
-            disk = json.load(f)
-    except (FileNotFoundError, ValueError, OSError):
-        disk = {}
-    cached = disk.get(str(roc_year))
-    if cached and not refresh:
-        _HOLIDAY_CACHE[roc_year] = cached
+    path = _holiday_cache_path()
+    disk = _read_holiday_cache()
+    entry = disk.get(str(roc_year)) or {}
+    cached = entry.get('days')
+    if cached and not refresh and not _stale(entry.get('fetched')):
+        _HOLIDAY_CACHE[roc_year] = entry
         return cached
+
+    # 2. We have to ask. Throttle the attempt so a stale copy plus an unreachable
+    #    exchange can't turn every open/closed check into a 20-second timeout —
+    #    that would freeze the live board rather than merely leave it out of date.
+    last = _HOLIDAY_TRY_AT.get(roc_year)
+    if not refresh and last and (datetime.datetime.now() - last).total_seconds() < _HOLIDAY_RETRY_SECS:
+        return cached or {}
+    _HOLIDAY_TRY_AT[roc_year] = datetime.datetime.now()
 
     try:
         resp = requests.get(_HOLIDAY_URL, params={'response': 'json', 'queryYear': str(roc_year)},
@@ -427,16 +477,38 @@ def fetch_market_holidays(roc_year, refresh=False):
                   f"dropped a stale cached copy.")
         return {}
 
-    disk[str(roc_year)] = found
-    disk['fetched_at'] = _now()
+    entry = {'fetched': datetime.date.today().isoformat(), 'days': found}
+    disk[str(roc_year)] = entry
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(disk, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
-    _HOLIDAY_CACHE[roc_year] = found
+    _HOLIDAY_CACHE[roc_year] = entry
     return found
+
+
+def warm_holiday_cache(today=None):
+    """Pre-load this year's calendar, and next year's once TWSE has issued it.
+
+    Called at scheduler start-up. Without it the year rollover would depend on
+    the exchange being reachable at the exact moment the first job of January
+    runs; with it, next year's holidays are already on disk from whenever it was
+    first published (TWSE issues them in the autumn). Returns {roc_year: n_days}.
+    """
+    today = today or datetime.datetime.now(ZoneInfo('Asia/Taipei')).date()
+    years = [today.year - 1911]
+    if today.month >= 10:            # next year's schedule is out around then
+        years.append(today.year - 1911 + 1)
+    out = {}
+    for y in years:
+        try:
+            out[y] = len(fetch_market_holidays(y))
+        except Exception as exc:                                   # noqa: BLE001
+            print(f"[{_now()}] Holiday warm-up failed for {y}: {type(exc).__name__}: {exc}")
+            out[y] = 0
+    return out
 
 
 def market_holiday_name(day=None):
