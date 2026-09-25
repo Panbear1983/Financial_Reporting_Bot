@@ -57,6 +57,7 @@ def is_taiwan_weekday():
     """
     taiwan_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
     if taiwan_now.weekday() >= 5:
+        print("Taiwan market closed today — weekend.", flush=True)
         return False
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -78,7 +79,8 @@ def _sandbox_label():
 
 def run_report(mode='closing'):
     if not is_taiwan_weekday():
-        print(f"Skipping {mode} report — weekend in Taiwan.", flush=True)
+        # The reason (weekend / which holiday) is printed by the check itself.
+        print(f"Skipping {mode} report — not a trading day.", flush=True)
         return
     print(f"Executing TWSE {mode} report...{_sandbox_label()}", flush=True)
     result = subprocess.run([sys.executable, 'twse_daily_report.py', f'--mode={mode}'])
@@ -89,7 +91,7 @@ def run_report(mode='closing'):
 def run_streak_alert():
     """Post-close push naming holdings on a 3+ session run (streak_alert.py)."""
     if not is_taiwan_weekday():
-        print("Skipping streak alert — weekend in Taiwan.", flush=True)
+        print("Skipping streak alert — not a trading day.", flush=True)
         return
     print(f"Executing streak alert...{_sandbox_label()}", flush=True)
     result = subprocess.run([sys.executable, 'streak_alert.py'])
