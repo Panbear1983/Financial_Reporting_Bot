@@ -47,8 +47,29 @@ if SANDBOX:
 # ---------------------------------------------------------------------------
 
 def is_taiwan_weekday():
+    """True when the Taiwan exchange actually trades today.
+
+    Named for Mon–Fri, which is all it used to check — and on 2026-09-25 (中秋節)
+    that published a full morning report against a closed market, quoting the
+    previous session's prices as today's. It now also consults TWSE's own
+    holiday calendar via the data layer, falling back to the weekday test if
+    that calendar can't be reached.
+    """
     taiwan_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-    return taiwan_now.weekday() < 5  # Mon=0, Fri=4
+    if taiwan_now.weekday() >= 5:
+        return False
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from dashboard import market_holiday_name
+        holiday = market_holiday_name(taiwan_now.date())
+    except Exception as exc:                                       # noqa: BLE001
+        print(f"Holiday check unavailable ({type(exc).__name__}: {exc}) — "
+              f"treating as a trading day.", flush=True)
+        return True
+    if holiday:
+        print(f"Taiwan market closed today — {holiday}.", flush=True)
+        return False
+    return True
 
 
 def _sandbox_label():

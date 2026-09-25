@@ -352,11 +352,95 @@ def fetch_live_quotes(codes, symbol_map, daily=None):
     return quotes
 
 
+_HOLIDAY_URL   = 'https://www.twse.com.tw/rwd/zh/holidaySchedule/holidaySchedule'
+_HOLIDAY_CACHE = {}          # ROC year (int) -> {date_str: name}
+
+
+def _holiday_cache_path():
+    return os.path.join(DATA_DIR, 'market_holidays.json')
+
+
+def fetch_market_holidays(roc_year, refresh=False):
+    """{'YYYY-MM-DD': name} of days the exchange is CLOSED, from TWSE's own
+    published holiday schedule (開休市日期), cached to disk.
+
+    A weekday can still be a non-trading day — 中秋節, 國慶日, Lunar New Year.
+    Nothing in this project knew that: every job gated on Mon–Fri alone and so
+    published a full report on a closed market, quoting the previous session's
+    prices as if they were today's.
+
+    Returns {} if the calendar has never been fetched and the network fails —
+    callers must treat that as "unknown", not as "no holidays", so a failed
+    lookup can never silently take the whole schedule offline.
+    """
+    roc_year = int(roc_year)
+    if not refresh and roc_year in _HOLIDAY_CACHE:
+        return _HOLIDAY_CACHE[roc_year]
+
+    path, disk = _holiday_cache_path(), {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            disk = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        disk = {}
+    cached = disk.get(str(roc_year))
+    if cached and not refresh:
+        _HOLIDAY_CACHE[roc_year] = cached
+        return cached
+
+    try:
+        resp = requests.get(_HOLIDAY_URL, params={'response': 'json', 'queryYear': str(roc_year)},
+                            timeout=20, verify=False)
+        rows = resp.json().get('data') or []
+        # ['2026-09-25', '中秋節', '依規定放假1日。'] — the exchange publishes the
+        # Gregorian date in column 0 even though the query is by ROC year.
+        found = {r[0].strip(): (r[1].strip() if len(r) > 1 else '')
+                 for r in rows if r and re.match(r'^\d{4}-\d{2}-\d{2}$', str(r[0]).strip())}
+    except Exception as exc:                                       # noqa: BLE001
+        print(f"[{_now()}] Holiday calendar fetch failed ({roc_year}): "
+              f"{type(exc).__name__}: {exc}")
+        return cached or {}
+    if not found:
+        return cached or {}
+
+    disk[str(roc_year)] = found
+    disk['fetched_at'] = _now()
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(disk, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+    _HOLIDAY_CACHE[roc_year] = found
+    return found
+
+
+def market_holiday_name(day=None):
+    """Name of the holiday closing the exchange on `day`, '' if it trades, or
+    None when the calendar is unavailable (unknown — never assume open)."""
+    day = day or datetime.datetime.now(ZoneInfo('Asia/Taipei')).date()
+    cal = fetch_market_holidays(day.year - 1911)
+    if not cal:
+        return None
+    return cal.get(day.isoformat(), '')
+
+
+def is_trading_day(day=None):
+    """True when the exchange trades on `day`: a weekday that is not on TWSE's
+    published holiday list. An unavailable calendar falls back to the weekday
+    test alone — the old behaviour — so a network failure cannot mute the
+    schedule outright."""
+    day = day or datetime.datetime.now(ZoneInfo('Asia/Taipei')).date()
+    if day.weekday() >= 5:
+        return False
+    return not market_holiday_name(day)
+
+
 def taiwan_market_open(now=None):
     if os.getenv('LIVE_PORTFOLIO_FORCE_OPEN') == '1':
         return True
     now = now or datetime.datetime.now(ZoneInfo('Asia/Taipei'))
-    if now.weekday() >= 5:
+    if not is_trading_day(now.date()):
         return False
     t = now.time()
     return datetime.time(9, 0) <= t <= datetime.time(13, 30)
