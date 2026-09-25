@@ -394,14 +394,38 @@ def fetch_market_holidays(roc_year, refresh=False):
         rows = resp.json().get('data') or []
         # ['2026-09-25', '中秋節', '依規定放假1日。'] — the exchange publishes the
         # Gregorian date in column 0 even though the query is by ROC year.
+        #
+        # Keep only dates that really fall in the year asked for. Querying a year
+        # TWSE has not published yet does NOT return empty — it silently serves the
+        # CURRENT year's calendar, so an unguarded fetch of next year would cache
+        # this year's holidays under next year's key and mis-gate every job for the
+        # following twelve months.
+        gregorian = roc_year + 1911
         found = {r[0].strip(): (r[1].strip() if len(r) > 1 else '')
-                 for r in rows if r and re.match(r'^\d{4}-\d{2}-\d{2}$', str(r[0]).strip())}
+                 for r in rows
+                 if r and re.match(r'^\d{4}-\d{2}-\d{2}$', str(r[0]).strip())
+                 and str(r[0]).strip().startswith(f'{gregorian}-')}
     except Exception as exc:                                       # noqa: BLE001
+        # Couldn't ask. Whatever we already knew is still the best answer.
         print(f"[{_now()}] Holiday calendar fetch failed ({roc_year}): "
               f"{type(exc).__name__}: {exc}")
         return cached or {}
     if not found:
-        return cached or {}
+        # We DID ask and the exchange has nothing for this year — it isn't
+        # published yet. Anything cached under this year came from the silent
+        # current-year substitution above, so it is provably wrong: drop it
+        # rather than keep gating on another year's holidays.
+        if cached:
+            disk.pop(str(roc_year), None)
+            _HOLIDAY_CACHE.pop(roc_year, None)
+            try:
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(disk, f, ensure_ascii=False, indent=2)
+            except OSError:
+                pass
+            print(f"[{_now()}] Holiday calendar for {roc_year} is not published yet — "
+                  f"dropped a stale cached copy.")
+        return {}
 
     disk[str(roc_year)] = found
     disk['fetched_at'] = _now()
