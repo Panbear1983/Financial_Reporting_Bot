@@ -33,3 +33,4 @@ cash_ledger.jsonl
 cash.json
 mis_prefix_cache.json
 official_close_cache.json
+cash_ledger_history/

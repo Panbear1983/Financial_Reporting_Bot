@@ -136,6 +136,9 @@ d.add_cash_entry('update', 512400, '0050 配息入帳', date='2026-09-30')
 d.add_cash_entry('withdraw', 20000, '個人開銷', date='2026-10-01')
 st = d.cash_status()
 check('ledger balance replays to 492,400', st['balance'] == 492400.0, str(st['balance']))
+_hist = sorted(os.listdir(os.path.join(_tmp, d.CASH_HISTORY_DIR)))
+check('every write after the first keeps a dated copy of the ledger before it',
+      len(_hist) == 3 and _hist[0].startswith('cash_ledger_before_0002_'), str(_hist))
 check('a dividend is NOT counted as money put in (net flow +30,000)', st['net_flow'] == 30000.0)
 for args, why in ((('withdraw', 10**9, 'x'), 'overdraw'), (('deposit', 100, ''), 'missing note'),
                   (('open', 1, 'x'), 'second opening'), (('deposit', 1, 'x', '2099-01-01'), 'future date')):

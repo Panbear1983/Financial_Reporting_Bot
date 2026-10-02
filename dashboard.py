@@ -851,6 +851,7 @@ CASH_TYPES       = ('open', 'deposit', 'withdraw', 'update')
 CASH_TYPE_LABEL  = {'open': '開帳', 'deposit': '存入', 'withdraw': '提出', 'update': '調整'}
 CASH_STALE_DAYS  = 30
 CASH_MAX_AMOUNT  = 1e10          # a typo guard, not a policy
+CASH_HISTORY_DIR = 'cash_ledger_history'   # the ledger as it stood before each write
 _cash_cache = {'key': None, 'status': None}
 
 
@@ -1008,6 +1009,16 @@ def add_cash_entry(kind, value, note='', date=None):
             old = f.read()
     except FileNotFoundError:
         old = b''
+    if old:
+        # Keep the ledger as it stood before this write. Local only, by Peter's
+        # rule (his financial records never go online); it guards against a
+        # corrupted file or a slip, not against losing the Mac — the encrypted
+        # Time Machine drive covers that.
+        hist = os.path.join(DATA_DIR, CASH_HISTORY_DIR)
+        os.makedirs(hist, exist_ok=True)
+        stamp = datetime.datetime.now(ZoneInfo('Asia/Taipei')).strftime('%Y%m%d_%H%M%S')
+        with open(os.path.join(hist, f"cash_ledger_before_{entry['id']:04d}_{stamp}.jsonl"), 'wb') as f:
+            f.write(old)
     if old and not old.endswith(b'\n'):
         old += b'\n'
     tmp = path + '.tmp'
