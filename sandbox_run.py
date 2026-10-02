@@ -33,7 +33,7 @@ def _banner(title):
 
 
 def run_morning():
-    _banner('TWSE Morning Report (01:30 UTC / 09:30 Taiwan)')
+    _banner('TWSE Morning Report (01:05 UTC / 09:05 Taiwan)')
     generate_daily_report(mode='morning', send=True)
 
 

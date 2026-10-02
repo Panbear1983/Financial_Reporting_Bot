@@ -608,18 +608,146 @@ def menu_portfolio():
         header('Portfolio Holdings')
         _portfolio_table(portfolio)
 
-        console.print('\n[cyan][a][/cyan] Add  [cyan][e][/cyan] Edit  '
-                      f'[cyan][d][/cyan] Delete  [cyan][i][/cyan] Import CSV ({import_count})  '
-                      '[cyan][m][/cyan] Mappings  [cyan][g][/cyan] Graphs  [cyan][b][/cyan] Back')
-        choice = Prompt.ask('Action', choices=['a','e','d','i','m','g','b'], default='b')
+        cs = _dashboard().cash_status()
+        cash_tag = (f'{cs["balance"]:,.0f}元' if cs and cs.get('balance') is not None
+                    else 'not set')
+        console.print('\n[cyan]\\[a][/cyan] Add  [cyan]\\[e][/cyan] Edit  '
+                      f'[cyan]\\[d][/cyan] Delete  [cyan]\\[i][/cyan] Import CSV ({import_count})  '
+                      f'[cyan]\\[c][/cyan] Cash ({cash_tag})  '
+                      '[cyan]\\[m][/cyan] Mappings  [cyan]\\[g][/cyan] Graphs  [cyan]\\[b][/cyan] Back')
+        choice = Prompt.ask('Action', choices=['a','e','d','i','c','m','g','b'], default='b')
 
         if   choice == 'a': _portfolio_add(portfolio)
+        elif choice == 'c': menu_cash()
         elif choice == 'e': _portfolio_edit(portfolio)
         elif choice == 'd': _portfolio_delete(portfolio)
         elif choice == 'i': menu_import_csv()
         elif choice == 'm': _menu_name_mappings()
         elif choice == 'g': _menu_graphs(portfolio)
         else: break
+
+
+def _dashboard():
+    """The data layer, pointed at the SAME data folder this dashboard edits.
+
+    dashboard.py picks its folder from FRB_DATA_DIR or the repo's data/, while
+    this screen resolves DATA_DIR its own way. Cash must land beside the
+    portfolio it belongs to, so the data layer is pointed here explicitly."""
+    import dashboard
+    if os.path.abspath(str(dashboard.DATA_DIR)) != os.path.abspath(str(DATA_DIR)):
+        dashboard.DATA_DIR = str(DATA_DIR)
+        dashboard._cash_cache['key'] = None
+    return dashboard
+
+
+_CASH_HELP = {
+    'open':     ('Opening balance your broker shows (元)',
+                 'Day zero — total-wealth history counts from here. Set once only.'),
+    'deposit':  ('Amount deposited from outside (元)',
+                 'New money in, e.g. salary. Never counted as a gain.'),
+    'withdraw': ('Amount withdrawn to spend (元)',
+                 'Money taken out, e.g. living costs. Never counted as a loss.'),
+    'update':   ('Balance your broker shows now (元)',
+                 'The difference counts as investment result — a dividend, a sale settling, a fee.'),
+}
+
+
+def _cash_entry(d, kind, note_default=''):
+    """Ask for one ledger entry and record it. Entries are final: a mistake is
+    fixed by adding a correcting entry, never by editing — that is what keeps
+    the ledger a track record."""
+    label = d.CASH_TYPE_LABEL[kind]
+    ask, explain = _CASH_HELP[kind]
+    console.print(f'\n[bold]{label}[/bold]  [dim]{explain}[/dim]')
+    value = Prompt.ask(ask)
+    day = Prompt.ask('Date (YYYY-MM-DD)', default=d._taipei_today().isoformat())
+    note = Prompt.ask('Note 備註 — the reason' + ('' if kind == 'open' else ' (required)'),
+                      default=note_default or ('初始餘額' if kind == 'open' else None))
+    console.print(f'[dim]Will record: {label} {value} on {day} — {note or ""}. '
+                  f'Entries cannot be edited or deleted afterwards.[/dim]')
+    if not Confirm.ask('Record it?', default=True):
+        return None
+    try:
+        e = d.add_cash_entry(kind, value, note, day)
+    except ValueError as x:
+        console.print(f'[red]✗ {x}[/red]')
+        return None
+    console.print(f"[green]✓ #{e['id']} {label} {e['amount']:+,.0f}元 → "
+                  f"balance {e['balance_after']:,.0f}元[/green]")
+    return e
+
+
+def menu_cash():
+    """Brokerage settlement-account cash (交割戶): the ledger, and new entries.
+
+    Cash never enters a performance number — the reports and the board show it
+    only as a balance, total wealth and the stock/cash split."""
+    d = _dashboard()
+    while True:
+        header('Brokerage Cash 交割戶現金')
+        entries, bad = d.load_cash_ledger()
+        st = d.cash_status()
+        opened = bool(st and st.get('balance') is not None)
+        if opened:
+            console.print(f"Balance [bold yellow]{st['balance']:,.0f}元[/bold yellow] · "
+                          f"opened {st['opened']} · last updated {st['as_of']} "
+                          f"({st['age_days']} day(s) ago)")
+            console.print(f"[dim]Your own deposits − withdrawals since opening: "
+                          f"{st['net_flow']:+,.0f}元 (excluded from any gain)[/dim]")
+            if st['stale']:
+                console.print(f'[yellow]⚠ not updated for over {d.CASH_STALE_DAYS} days — '
+                              f'the reports flag it[/yellow]')
+        else:
+            console.print('[dim]No cash recorded yet. Start with \\[o]: the opening balance is '
+                          'day zero, and total-wealth history counts from there.[/dim]')
+        if bad:
+            console.print(f'[red]⚠ {bad} unreadable line(s) in {d.cash_ledger_path()} — '
+                          f'new entries are blocked until it is fixed.[/red]')
+        if entries:
+            t = Table(box=box.ROUNDED)
+            for col, kw in [('#', dict(style='dim', justify='right')), ('Date 日期', {}),
+                            ('Type 類型', {}), ('Amount 金額', dict(justify='right')),
+                            ('Balance 餘額', dict(justify='right')), ('Note 備註', {}),
+                            ('Entered 輸入', dict(style='dim'))]:
+                t.add_column(col, **kw)
+            for e in entries[-20:]:
+                amt = e['amount']
+                colour = 'green' if amt > 0 else ('red' if amt < 0 else 'white')
+                t.add_row(str(e.get('id', '')), e['date'], d.CASH_TYPE_LABEL.get(e['type'], e['type']),
+                          f'[{colour}]{amt:+,.0f}[/{colour}]' if e['type'] != 'open' else f'{amt:,.0f}',
+                          f"{e.get('balance_after', 0):,.0f}", e.get('note', ''),
+                          str(e.get('entered_at', ''))[:16])
+            console.print(t)
+            if len(entries) > 20:
+                console.print(f'[dim]latest 20 of {len(entries)} entries[/dim]')
+        if opened:
+            console.print('\n[cyan]\\[d][/cyan] Deposit 存入  [cyan]\\[w][/cyan] Withdraw 提出  '
+                          '[cyan]\\[u][/cyan] Update balance 調整  [cyan]\\[b][/cyan] Back')
+            keys = {'d': 'deposit', 'w': 'withdraw', 'u': 'update'}
+        else:
+            console.print('\n[cyan]\\[o][/cyan] Opening balance 開帳  [cyan]\\[b][/cyan] Back')
+            keys = {'o': 'open'}
+        choice = Prompt.ask('Action', choices=list(keys) + ['b'], default='b')
+        if choice == 'b':
+            break
+        _cash_entry(d, keys[choice])
+        pause()
+
+
+def _offer_cash_after_import():
+    """Holdings and cash must move together: a sale re-imported without its
+    proceeds would read as a loss of the whole sale."""
+    d = _dashboard()
+    st = d.cash_status()
+    opened = bool(st and st.get('balance') is not None)
+    console.print('\n[dim]Holdings and cash should move together — a sale whose proceeds '
+                  'are not recorded reads as a loss of the whole sale.[/dim]')
+    if opened:
+        if Confirm.ask(f"Update your brokerage cash too? (now {st['balance']:,.0f}元)", default=True):
+            _cash_entry(d, 'update', note_default='CSV 匯入後核對券商餘額')
+    elif Confirm.ask('Start tracking your brokerage cash now? (opening balance = day zero)',
+                     default=False):
+        _cash_entry(d, 'open')
 
 
 def _menu_graphs(portfolio):
@@ -810,13 +938,15 @@ def menu_schedule():
     t.add_column('UTC',             style='yellow', justify='center')
     t.add_column('Taiwan (UTC+8)',  style='dim',    justify='center')
 
-    m_utc = sched.get('morning_utc',  '01:30')
+    m_utc = sched.get('morning_utc',  '01:05')
     c_utc = sched.get('closing_utc',  '08:00')
 
     t.add_row('Morning 開盤', m_utc, _utc_to_taiwan(m_utc))
     t.add_row('Closing 收盤', c_utc, _utc_to_taiwan(c_utc))
     console.print(t)
-    console.print('[dim]Scheduler must be restarted inside the container for changes to apply.[/dim]\n')
+    console.print('[dim]Restart the scheduler for changes to apply: '
+                  'launchctl kickstart -k gui/$(id -u)/com.panbear.financial-reporting-bot '
+                  '(not during a report slot).[/dim]\n')
 
     if Confirm.ask('Edit times?', default=False):
         new_m = Prompt.ask('Morning UTC (HH:MM)', default=m_utc)
@@ -1007,6 +1137,7 @@ def menu_import_csv():
         save_json(_config_path('portfolio.json'), new_portfolio)
         console.print(f'[green]✓ Portfolio updated — {len(new_portfolio)} holdings, {new_total:,.0f}元[/green]')
         _archive_import_csv(selected)
+        _offer_cash_after_import()
 
     pause()
 
@@ -1435,14 +1566,13 @@ def menu_api_keys():
 # [8] Report Layout
 # ---------------------------------------------------------------------------
 
+# The 09:05 push since the 2026-10-02 rebuild: no watchlist, no AI sections.
 MORNING_SECTION_LABELS = [
-    ('market_overview', '市場總覽'),
-    ('global_markets',  '全球市場'),
+    ('market_overview', '加權指數（隔夜與開盤）'),
+    ('global_markets',  '全球市場（隔夜）'),
     ('holdings',        '持倉列表'),
     ('cost_line',       '  └ 損益摘要行'),
-    ('watchlist',       '觀察清單'),
-    ('ai_outlook',      'AI 開盤展望'),
-    ('report_summary',  'AI 報告總結'),
+    ('yesterday',       '昨日重點'),
 ]
 
 CLOSING_SECTION_LABELS = [

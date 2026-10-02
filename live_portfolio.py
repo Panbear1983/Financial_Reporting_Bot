@@ -276,16 +276,36 @@ def build_live_table(portfolio, quotes, market_open=None, streaks=None):
                   streak, run_pct)
 
     tot = calc['total']
+    cash = tot.get('cash')            # None unless a cash ledger exists
+    if cash is not None:
+        # Brokerage cash, pinned under the holdings. Never priced, never in P/L.
+        t.add_row('', '[bold yellow]CASH[/bold yellow]', '現金 / 活存餘額', '', '—', '—',
+                  f'{cash:,.0f}', '—', '—', '—', '—', '')
     if tot['value']:
         # Say so when the Total covers only part of the book, so a shrunken
         # figure is never mistaken for the market moving.
-        label = ('Total' if not calc['n_unpriced']
-                 else f"Total ({tot['n_priced']}/{tot['n_total']})")
+        base = 'Stock Value' if cash is not None else 'Total'
+        label = (base if not calc['n_unpriced']
+                 else f"{base} ({tot['n_priced']}/{tot['n_total']})")
         t.add_section()
         t.add_row('', '', f'[bold]{label}[/bold]', '', '',
                   '', f"[bold]{tot['value']:,.0f}[/bold]", _fmt_signed(tot['pnl']),
                   _fmt_signed(tot['pnl_pct'], pct=True), _fmt_signed(tot['daily_pnl']),
                   '', '')
+    if cash is not None:
+        # The second tier: stocks + cash, and the split. P/L above stays stocks-only.
+        nav = (f"[bold]{tot['total_wealth']:,.0f}[/bold]"
+               if tot.get('allocation_valid') else '[dim]—[/dim]')
+        t.add_row('', '', '[bold]Total NAV[/bold]', '', '', '', nav, '', '', '', '', '')
+        if tot.get('allocation_valid'):
+            cap = (f"Allocation: {tot['equity_pct']:.1f}% Stock / {tot['cash_pct']:.1f}% Cash"
+                   f" · cash as of {tot.get('cash_as_of')}")
+        else:
+            cap = (f"Total NAV hidden — {tot['n_total'] - tot['n_priced']} holding(s) have no"
+                   f" quote · cash as of {tot.get('cash_as_of')}")
+        if tot.get('cash_stale'):
+            cap += f" · [yellow]⚠ cash not updated for {tot['cash_age_days']} days[/yellow]"
+        t.caption = cap
     return t, calc['n_unpriced'], calc['frozen']
 
 
@@ -564,7 +584,9 @@ def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
                          f"(no bars at this interval)")
         # Reserve a row per note (and one for the legend) so the chart shrinks
         # instead of scrolling them off.
-        chart_h = max(H - len(portfolio) - 17 - len(notes), 8)
+        # CASH row + Total NAV row + allocation caption, when a cash ledger exists.
+        cash_rows = 3 if table.caption else 0
+        chart_h = max(H - len(portfolio) - 17 - len(notes) - cash_rows, 8)
         parts.append(candle_renderable(entry['total'], f'Total Portfolio — {label}',
                                        w, chart_h, hline=total_cost, y_mode=y_mode)
                      if entry is not None else Text('fetching…', style='dim'))

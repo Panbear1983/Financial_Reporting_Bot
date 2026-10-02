@@ -16,6 +16,19 @@ Automated Taiwan-market reporting for OpenClaw: a scheduled TWSE/TPEX intelligen
 - Provides a Rich terminal UI for portfolio, watchlist, schedule, layout, AI, sandbox, and delivery configuration.
 - Includes a Telegram control bot for mobile-friendly status checks, watchlist commands, portfolio review, and on-demand report triggers.
 
+## What's New — 2026-10 (morning push rebuild + brokerage cash)
+
+- **Morning push now 09:05 Taipei (01:05 UTC), on the exchange's own real-time prices** (mis.twse.com.tw).
+  Yahoo's TWSE quotes run ~20 minutes late, so the old 09:30 push was built on ~09:10 prices. Four
+  blocks, no AI: overnight moves + the open, today's holdings each with its streak (counted through the
+  last close) and a ⚡ extending / ⚠️ breaking flag for runs of 3+, and last night's closing facts.
+  Full contract and measurements: `docs/MORNING_REBUILD_2026-10-02.md`.
+- **Brokerage cash ledger.** Dashboard → Portfolio → `[c] Cash`: an append-only record of the
+  settlement account (opening balance, deposits, withdrawals, balance updates), each with a date and a
+  note. Both pushes and the live board show cash, total wealth and the stock/cash split — and cash
+  never enters any P/L figure. Lives in `data/cash_ledger.jsonl` (gitignored).
+- **Checks:** `.venv/bin/python3.11 tools/verify_morning.py` (add `--offline` to skip the live calls).
+
 ## What's New — 2026-07 Overhaul
 
 A full reliability + cost pass over data acquisition, AI analysis, delivery, and tooling
@@ -142,7 +155,7 @@ Controls schedule, AI models, report layout, technical thresholds, delivery chan
 
 ```json
 {
-  "schedule": { "morning_utc": "01:30", "closing_utc": "08:00" },
+  "schedule": { "morning_utc": "01:05", "closing_utc": "08:00" },
   "ai": {
     "model": "anthropic/claude-haiku-4.5",
     "max_tokens_reason": 100,
@@ -274,7 +287,7 @@ Sandbox runs write preview files such as:
   per-symbol chart-API calls are a last resort (they rate-limit aggressively).
 - The analyst summary reads a note-free structured digest of objective signals (never the
   AI-written per-stock text) to avoid AI-of-AI echo, and covers market + holdings only.
-- Scheduler times are UTC by design: default `01:30` UTC for Taiwan open and `08:00` UTC for Taiwan close.
+- Scheduler times are UTC by design: default `01:05` UTC (09:05 Taiwan) for the open and `08:00` UTC for Taiwan close.
 - Weekend checks use Taiwan local weekday logic.
 - Telegram delivery is chunked at line boundaries with a plain-text fallback, so Markdown
   entities never split across messages and a parse failure can't drop content.

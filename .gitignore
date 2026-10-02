@@ -26,3 +26,10 @@ auth-profiles.json
 credentials/
 tracked_stocks.json
 .DS_Store
+
+# Brokerage cash ledger and caches (personal data; data/ is already ignored —
+# named here too in case anything ever writes them at the repo root)
+cash_ledger.jsonl
+cash.json
+mis_prefix_cache.json
+official_close_cache.json

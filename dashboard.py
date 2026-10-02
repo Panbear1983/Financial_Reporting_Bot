@@ -25,6 +25,8 @@ import csv
 import json
 import time
 import datetime
+import subprocess
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -352,6 +354,286 @@ def fetch_live_quotes(codes, symbol_map, daily=None):
     return quotes
 
 
+# ---------------------------------------------------------------------------
+# The exchange's OWN real-time quotes (mis.twse.com.tw)
+#
+# Yahoo is on a hard ~20-minute delay for TWSE. Measured 2026-09-30: at 09:15
+# every Yahoo quote was still stamped with the previous session's 13:30 close and
+# today's 1-minute bars did not exist; the feed only rolled over at 09:20:37. So a
+# 09:05 push cannot be built on it. The exchange publishes its own feed with no
+# delay, and this is it. Full field semantics, every one of them measured from
+# this Mac, are in docs/MORNING_REBUILD_2026-10-02.md — read that before touching
+# this block, because three of the fields do not mean what their names suggest.
+# ---------------------------------------------------------------------------
+
+_MIS_URL      = 'https://mis.twse.com.tw/stock/api/getStockInfo.jsp'
+_MIS_INDEX_CH = 'tse_t00.tw'            # 發行量加權股價指數
+_MIS_INDEX_C  = 't00'                   # ...which comes back keyed 't00', NOT '_t00'
+_MIS_HEADERS  = {
+    # Both headers are required; without the Referer the service refuses.
+    'User-Agent': ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+                   '(KHTML, like Gecko) Chrome/120.0 Safari/537.36'),
+    'Referer': 'https://mis.twse.com.tw/stock/index.jsp',
+}
+_MIS_PREFIX_FILE = 'mis_prefix_cache.json'
+# 3595 answers on NEITHER tse_ nor otc_ (measured 2026-10-02 — both channels came
+# back as the junk row). Seeded so it never costs a probe and never counts as a
+# fallback that would fire the delayed-prices warning on every single run.
+_MIS_PREFIX_SEED = {'3595': 'none'}
+
+
+def _f(v):
+    """MIS numeric field -> float, or None. '-' is its no-trade-yet marker.
+
+    Every numeric field goes through this. Before a stock's first match of the day
+    MIS serves '-' in z, o AND the bid ladder, and bare float() on any of them
+    raises ValueError — at 09:05, which is the only time this code runs.
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s in ('', '-'):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _mis_prefix_path():
+    return os.path.join(DATA_DIR, _MIS_PREFIX_FILE)
+
+
+def _mis_prefixes():
+    """{code: 'tse'|'otc'|'none'} — which channel each code answers on."""
+    try:
+        with open(_mis_prefix_path(), 'r', encoding='utf-8') as f:
+            cached = json.load(f)
+    except (OSError, ValueError):
+        cached = {}
+    merged = dict(_MIS_PREFIX_SEED)
+    if isinstance(cached, dict):
+        merged.update(cached)           # a later successful probe may override a seed
+    return merged
+
+
+def _save_mis_prefixes(prefixes):
+    path = _mis_prefix_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(prefixes, f, ensure_ascii=False, indent=1, sort_keys=True)
+        os.replace(tmp, path)           # atomic — the board reads this while we write
+    except OSError:
+        pass
+
+
+def _mis_get(ex_ch, timeout=20):
+    """Raw MIS payload for one pipe-joined ex_ch string, or None.
+
+    requests first, curl as the retry: Python's TLS has failed certificate
+    verification on this Mac before, and curl is the proven path.
+    """
+    params = {'ex_ch': ex_ch, 'json': '1', 'delay': '0'}
+    try:
+        r = requests.get(_MIS_URL, params=params, headers=_MIS_HEADERS, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except Exception:                                                  # noqa: BLE001
+        pass
+    try:
+        url = _MIS_URL + '?' + urllib.parse.urlencode(params)
+        done = subprocess.run(
+            ['curl', '-sS', '-m', str(timeout), '-A', _MIS_HEADERS['User-Agent'],
+             '-H', 'Referer: ' + _MIS_HEADERS['Referer'], url],
+            capture_output=True, text=True, timeout=timeout + 5)
+        # A malformed ex_ch answers with ~20 bytes of newlines and no JSON at all.
+        return json.loads(done.stdout)
+    except Exception:                                                  # noqa: BLE001
+        return None
+
+
+def _mis_row(m):
+    """One msgArray entry -> a quote dict in fetch_live_quotes' shape, or None.
+
+    Returns None when the row carries no usable price, and the CALLER must then
+    leave that code out of its result entirely so it falls through to Yahoo.
+    Emitting a quote with price=None instead crashes compute_positions, which
+    guards only `if not q` — a dict with a None price is truthy and reaches
+    `price - prev`.
+    """
+    code = (m.get('c') or '').strip()
+    if not code:
+        return None                     # the junk row an unservable channel returns
+    price = _f(m.get('z'))
+    if price is None:                                 # between matches / before the first
+        price = _f((m.get('b') or '').split('_')[0])  # top of the bid ladder
+    if price is None:
+        price = _f(m.get('o'))
+    prev = _f(m.get('y'))
+    if price is None or prev is None:
+        return None
+    op = _f(m.get('o'))
+    # The price time is d + t. NOT tlong: for stocks tlong is the 14:30 盤後定價
+    # stamp (measured — 2330 returns t=13:30:00, ot=14:30:00, tlong -> 14:30:00),
+    # so building the "honest timestamp" on it would overstate freshness by an hour.
+    day, clock = m.get('d'), m.get('t')
+    quote_at = None
+    if day and clock:
+        try:
+            quote_at = (datetime.datetime.strptime(day + clock, '%Y%m%d%H:%M:%S')
+                        .replace(tzinfo=ZoneInfo('Asia/Taipei')).astimezone())
+        except ValueError:
+            quote_at = None
+    today = datetime.datetime.now(ZoneInfo('Asia/Taipei')).strftime('%Y%m%d')
+    return {
+        'name': m.get('n') or code,
+        'price': price,
+        'prev_close': prev,
+        'today_open': op if op is not None else prev,
+        'exch_open': op,                # None until the stock's first match
+        'change': price - prev,
+        'intraday_change': (price - op) if op is not None else 0.0,
+        'quote_at': quote_at,
+        'intraday': bool(day == today and clock and clock <= '13:35:00'),
+        'src': 'mis',
+        'session_date': day,
+    }
+
+
+def fetch_mis_quotes(codes, want_index=False, timeout=20, chunk=40, unmatched=None):
+    """{code: quote} from the exchange's real-time feed, plus '_t00' for the index.
+
+    A code is absent from the result when the exchange has no usable price for it —
+    unservable, or not yet matched today. Pass a list as `unmatched` to learn
+    which: codes the exchange ANSWERED for but could not price are appended to
+    it. Those must NOT be filled from Yahoo at 09:05 — Yahoo has not rolled over
+    by then, so it would put yesterday's move into today's figures. Only codes
+    the exchange did not answer for at all fall through to Yahoo (as delayed).
+    """
+    codes = [str(c) for c in codes]
+    prefixes = _mis_prefixes()
+    out, learned = {}, dict(prefixes)
+
+    def ask(channels):
+        """Pipe-joined channels -> {bare code: row}. 19 symbols measured at 1.33s."""
+        rows = {}
+        for i in range(0, len(channels), chunk):
+            payload = _mis_get('|'.join(channels[i:i + chunk]), timeout=timeout)
+            if not isinstance(payload, dict) or payload.get('rtcode') != '0000':
+                continue                # rtcode 9999 = 參數不足; None = transport/JSON failure
+            for m in payload.get('msgArray') or []:
+                c = (m.get('c') or '').strip()
+                if c:
+                    rows[c] = m
+        return rows
+
+    # Pass 1 — known prefixes as known, unknown codes tried on tse_ (the common case).
+    first, pending = [], []
+    if want_index:
+        first.append(_MIS_INDEX_CH)
+    for c in codes:
+        p = prefixes.get(c)
+        if p == 'none':
+            continue                    # measured unservable; don't waste a channel
+        first.append(f'{p if p in ("tse", "otc") else "tse"}_{c}.tw')
+        if p not in ('tse', 'otc'):
+            pending.append(c)
+    rows = ask(first) if first else {}
+
+    # Pass 2 — anything unknown that tse_ did not answer gets one otc_ attempt.
+    retry = [c for c in pending if c not in rows]
+    if retry:
+        rows.update(ask([f'otc_{c}.tw' for c in retry]))
+
+    for c in pending:
+        learned[c] = 'tse' if c in rows and f'tse_{c}.tw' in first else (
+            'otc' if c in rows else 'none')
+    if learned != prefixes:
+        _save_mis_prefixes(learned)
+
+    # The index is special-cased BEFORE the generic keying, so '_t00' is never
+    # mistaken for a holding code and the caller's pop() always finds it.
+    if want_index and _MIS_INDEX_C in rows:
+        idx = _mis_row(rows.pop(_MIS_INDEX_C))
+        if idx:
+            out['_t00'] = idx
+    for c, m in rows.items():
+        q = _mis_row(m)
+        if q:
+            out[c] = q
+        elif unmatched is not None:
+            unmatched.append(c)
+    return out
+
+
+def exchange_is_quoting(timeout=10):
+    """True / False / None — is the exchange publishing TODAY's session right now?
+
+    None means UNKNOWN (probe failed, or the payload was not well formed) and a
+    caller must never read it as a closure. Only an index row carrying a parseable
+    session date strictly earlier than today answers False — that is the 颱風假
+    case, announced the night before and never present in TWSE's published
+    holiday calendar.
+
+    Neither rtcode nor queryTime can answer this: measured 2026-10-02 at 17:32,
+    with the market long shut, rtcode was still '0000' and queryTime read
+    '20261002 17:32:50' — the server's wall clock. Only d/t carry the session.
+
+    Deliberately NOT reachable from taiwan_market_open() / is_trading_day():
+    taiwan_market_open() sits on the live board's render path at ~4 calls/second,
+    and one network round trip there freezes the screen.
+    """
+    payload = _mis_get(_MIS_INDEX_CH, timeout=timeout)
+    if not isinstance(payload, dict) or payload.get('rtcode') != '0000':
+        return None
+    row = next((m for m in (payload.get('msgArray') or [])
+                if (m.get('c') or '').strip() == _MIS_INDEX_C), None)
+    if row is None:
+        return None
+    try:
+        day = datetime.datetime.strptime(row.get('d'), '%Y%m%d').date()
+    except (TypeError, ValueError):
+        return None
+    today = datetime.datetime.now(ZoneInfo('Asia/Taipei')).date()
+    if day == today:
+        return True
+    return False if day < today else None
+
+
+def morning_gate(retries=2, wait=60):
+    """Should the 09:05 push go out? -> {'skip': bool, 'quoting': True|False|None, 'reason': str}
+
+    The published holiday calendar is checked first, by the scheduler. This
+    catches what the calendar never learns about: a 颱風假 announced the night
+    before. It skips ONLY on a definite False from exchange_is_quoting(), asked
+    again `retries` times `wait` seconds apart so a slow first index print at
+    09:00 can never be mistaken for a closure. None (unknown) never skips — a
+    failed probe is not a closed market.
+
+    Not applied outside a calendar trading day after 09:00 Taipei: before the
+    open the index still carries yesterday's date by design, and on a weekend
+    the scheduler has already stopped the run.
+    """
+    now = datetime.datetime.now(ZoneInfo('Asia/Taipei'))
+    if not is_trading_day(now.date()) or now.time() < datetime.time(9, 0):
+        return {'skip': False, 'quoting': None, 'reason': ''}
+    q = exchange_is_quoting()
+    for _ in range(retries):
+        if q is not False:
+            break
+        print(f"[{_now()}] [MORNING] exchange index still on a previous session — "
+              f"asking again in {wait}s", flush=True)
+        time.sleep(wait)
+        q = exchange_is_quoting()
+    if q is False:
+        return {'skip': True, 'quoting': False,
+                'reason': ('證交所今日沒有開盤報價（可能為颱風假或臨時休市），'
+                           '今日不發送早盤報告。')}
+    return {'skip': False, 'quoting': q, 'reason': ''}
+
+
 _HOLIDAY_URL   = 'https://www.twse.com.tw/rwd/zh/holidaySchedule/holidaySchedule'
 _HOLIDAY_CACHE  = {}         # ROC year (int) -> {'days': {date: name}, 'fetched': 'YYYY-MM-DD'}
 _HOLIDAY_TRY_AT = {}         # ROC year (int) -> datetime of the last network attempt
@@ -542,7 +824,203 @@ def taiwan_market_open(now=None):
     return datetime.time(9, 0) <= t <= datetime.time(13, 30)
 
 
-def compute_positions(portfolio, quotes, market_open=None):
+# ---------------------------------------------------------------------------
+# Brokerage cash — an append-only ledger (added 2026-10-02)
+#
+# Peter's rule: cash never enters a performance number. It appears only as a
+# balance, in a total, and as a share of that total. The repo tracks his
+# brokerage settlement account (交割戶) and nothing else.
+#
+# Every change is a typed, dated, noted entry that is never edited or deleted —
+# a mistake is fixed by a new entry saying so — so the ledger is a track
+# record, and the balance is always replayed from it, never stored beside it.
+#
+#   open      the opening balance: day zero, counting starts here
+#   deposit   new money in from outside   (an external flow — never a gain)
+#   withdraw  money taken out to spend    (an external flow — never a loss)
+#   update    set the balance to what the broker shows; the difference is
+#             investment result (a dividend landing, a sale settling, a fee)
+#
+# amount is SIGNED (+ in, − out); for update it is the difference applied, so
+# the balance is simply open + Σ amount. Lives ONLY in DATA_DIR: _config_path's
+# repo-root fallback is not covered by .gitignore, and the repo is public.
+# ---------------------------------------------------------------------------
+
+CASH_LEDGER_FILE = 'cash_ledger.jsonl'
+CASH_TYPES       = ('open', 'deposit', 'withdraw', 'update')
+CASH_TYPE_LABEL  = {'open': '開帳', 'deposit': '存入', 'withdraw': '提出', 'update': '調整'}
+CASH_STALE_DAYS  = 30
+CASH_MAX_AMOUNT  = 1e10          # a typo guard, not a policy
+_cash_cache = {'key': None, 'status': None}
+
+
+def cash_ledger_path():
+    return os.path.join(DATA_DIR, CASH_LEDGER_FILE)
+
+
+def load_cash_ledger():
+    """(entries, bad_line_count), in the order written. Never raises: a scheduled
+    push must not die over a side file, but a bad line is counted, not hidden."""
+    entries, bad = [], 0
+    try:
+        with open(cash_ledger_path(), encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    e = json.loads(line)
+                    if not isinstance(e, dict) or e.get('type') not in CASH_TYPES:
+                        raise ValueError('unknown entry')
+                    e['amount'] = float(e['amount'])
+                    if e['amount'] != e['amount'] or abs(e['amount']) == float('inf'):
+                        raise ValueError('not a number')
+                    datetime.date.fromisoformat(str(e['date']))
+                    entries.append(e)
+                except (ValueError, TypeError, KeyError):
+                    bad += 1
+    except FileNotFoundError:
+        return [], 0
+    except OSError:
+        return [], 1
+    return entries, bad
+
+
+def _taipei_today():
+    return datetime.datetime.now(ZoneInfo('Asia/Taipei')).date()
+
+
+def cash_status():
+    """None when there is no ledger (the cash feature is simply off). Otherwise
+    {'balance', 'opened', 'as_of', 'age_days', 'stale', 'net_flow', 'n', 'bad'}.
+
+    balance is None when the ledger has no opening entry. as_of is the day the
+    figure was last touched, which is what staleness is about. net_flow is
+    deposits − withdrawals since opening: the money Peter put in himself, which
+    stage 3 subtracts from wealth growth so it never reads as a gain.
+
+    Cached on the file's size + mtime, because the live board asks on every
+    repaint (~4×/second)."""
+    try:
+        st = os.stat(cash_ledger_path())
+    except OSError:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    if _cash_cache['key'] == key:
+        return _cash_cache['status']
+    entries, bad = load_cash_ledger()
+    bal, opened, flow, last = None, None, 0.0, None
+    for e in entries:
+        if e['type'] == 'open':
+            if bal is None:
+                bal, opened = e['amount'], e['date']
+            continue
+        if bal is None:
+            continue
+        bal += e['amount']
+        if e['type'] in ('deposit', 'withdraw'):
+            flow += e['amount']
+    for e in entries:
+        stamp = str(e.get('entered_at') or e['date'])[:10]
+        last = stamp if last is None or stamp > last else last
+    age = None
+    if last:
+        try:
+            age = (_taipei_today() - datetime.date.fromisoformat(last)).days
+        except ValueError:
+            age = None
+    status = {'balance': bal, 'opened': opened, 'as_of': last, 'age_days': age,
+              'stale': bool(age is not None and age > CASH_STALE_DAYS),
+              'net_flow': flow, 'n': len(entries), 'bad': bad}
+    _cash_cache.update(key=key, status=status)
+    return status
+
+
+def add_cash_entry(kind, value, note='', date=None):
+    """Append one entry and return it, or raise ValueError with a reason in
+    Chinese that the dashboard can show as-is.
+
+    value is what Peter types: the opening balance for 'open', the amount moved
+    for 'deposit' / 'withdraw' (always positive), and the balance the broker now
+    shows for 'update'. The file is rewritten atomically with the old bytes
+    untouched plus one new line, so a reader never sees half an entry and no
+    earlier entry can change."""
+    if kind not in CASH_TYPES:
+        raise ValueError(f'未知的類型：{kind}')
+    try:
+        value = float(str(value).replace(',', '').strip())
+    except ValueError:
+        raise ValueError('金額必須是數字') from None
+    if value != value or value < 0 or value > CASH_MAX_AMOUNT:
+        raise ValueError('金額必須是 0 以上的合理數字')
+    note = (note or '').strip()[:200]
+    today = _taipei_today()
+    try:
+        day = datetime.date.fromisoformat(str(date)) if date else today
+    except ValueError:
+        raise ValueError('日期格式應為 YYYY-MM-DD') from None
+    if day > today:
+        raise ValueError('日期不能在未來')
+
+    entries, bad = load_cash_ledger()
+    if bad:
+        raise ValueError(f'現金帳本有 {bad} 行無法讀取 — 請先檢查 {cash_ledger_path()}，'
+                         f'不寫入新紀錄以免帳目錯亂')
+    status = cash_status() if entries else None
+    balance = status['balance'] if status else None
+
+    if kind == 'open':
+        if entries:
+            raise ValueError('帳本已開帳；初始餘額只能設定一次（要修正請用「調整」）')
+        amount, note = value, (note or '初始餘額')
+    else:
+        if balance is None:
+            raise ValueError('請先開帳（設定初始餘額）')
+        if day < datetime.date.fromisoformat(status['opened']):
+            raise ValueError(f"日期不能早於開帳日 {status['opened']}")
+        if not note:
+            raise ValueError('請寫下這筆紀錄的原因')
+        if kind == 'deposit':
+            if value == 0:
+                raise ValueError('存入金額必須大於 0')
+            amount = value
+        elif kind == 'withdraw':
+            if value == 0:
+                raise ValueError('提出金額必須大於 0')
+            if value > balance + 1e-9:
+                raise ValueError(f'提出金額超過目前餘額 {balance:,.0f}元')
+            amount = -value
+        else:                                   # update: set to what the broker shows
+            amount = value - balance
+
+    entry = {
+        'id': max((int(e.get('id', 0)) for e in entries), default=0) + 1,
+        'entered_at': datetime.datetime.now(ZoneInfo('Asia/Taipei')).strftime('%Y-%m-%d %H:%M:%S'),
+        'date': day.isoformat(),
+        'type': kind,
+        'amount': round(amount, 2),
+        'balance_after': round((balance or 0.0) + amount if kind != 'open' else amount, 2),
+        'note': note,
+    }
+    path = cash_ledger_path()
+    os.makedirs(DATA_DIR, exist_ok=True)
+    try:
+        with open(path, 'rb') as f:
+            old = f.read()
+    except FileNotFoundError:
+        old = b''
+    if old and not old.endswith(b'\n'):
+        old += b'\n'
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as f:
+        f.write(old + (json.dumps(entry, ensure_ascii=False) + '\n').encode('utf-8'))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _cash_cache['key'] = None
+    return entry
+
+
+def compute_positions(portfolio, quotes, market_open=None, with_cash=True):
     """THE position maths for this project — rows + totals, no rendering.
 
     Single source of truth, shared by the live board and by the TWSE morning
@@ -603,16 +1081,55 @@ def compute_positions(portfolio, quotes, market_open=None):
         'pnl_pct': ((tot_val - tot_cost) / tot_cost * 100) if tot_cost else 0.0,
         'n_priced': len(portfolio) - n_unpriced, 'n_total': len(portfolio),
     }
+    # Cash rides alongside, never inside: every key above stays stocks-only, so
+    # P/L, P/L% and 今日損益 mean exactly what they meant before cash existed.
+    # With no ledger nothing is added at all, and every caller sees the old dict.
+    cs = cash_status() if with_cash else None
+    if cs and cs.get('balance') is not None:
+        cash = cs['balance']
+        # A partial book would understate wealth and skew the split (measured:
+        # 2 of 8 unpriced moved the cash share by 10.9 points), so the total and
+        # the split are only offered when every holding is priced.
+        valid = n_unpriced == 0 and (tot_val + cash) > 0
+        total.update({
+            'cash': cash, 'cash_as_of': cs['as_of'], 'cash_age_days': cs['age_days'],
+            'cash_stale': cs['stale'], 'cash_bad_lines': cs['bad'],
+            'cash_net_flow': cs['net_flow'], 'cash_opened': cs['opened'],
+            'allocation_valid': valid,
+            'total_wealth': (tot_val + cash) if valid else None,
+            'equity_pct': (tot_val / (tot_val + cash) * 100) if valid else None,
+            'cash_pct': (cash / (tot_val + cash) * 100) if valid else None,
+        })
     return {'rows': rows, 'total': total, 'n_unpriced': n_unpriced, 'frozen': frozen}
 
 
-def close_streak(closes, market_open=None, today=None):
-    """Trailing run of same-direction daily closes → {'run': int, 'pct': float}, or None.
+STREAK_FLAT_RULES = ('break', 'skip')
 
-    run is signed: +3 = three straight higher closes, -2 = two straight lower,
-    0 = the newest close was flat against the one before (a flat day resets).
+
+def streak_flat_rule(cfg=None):
+    """bot_config streak.flat_rule — 'break' (default, the rule live since
+    2026-09-24) or 'skip'. Anything else reads as 'break'."""
+    cfg = cfg if cfg is not None else load_bot_config()
+    rule = str(((cfg or {}).get('streak') or {}).get('flat_rule', 'break')).lower()
+    return rule if rule in STREAK_FLAT_RULES else 'break'
+
+
+def close_streak(closes, market_open=None, today=None, flat_rule=None):
+    """Trailing run of same-direction daily closes → {'run', 'pct', 'as_of'}, or None.
+
+    run is signed: +3 = three straight higher closes, -2 = two straight lower.
     pct is the total move over that run, from the close just BEFORE it began
-    to the newest close, in percent.
+    to the newest close, in percent. as_of is the date of the newest close
+    counted — the morning push prints the run as "through yesterday's close",
+    and this is what makes that claim checkable.
+
+    A flat close (exactly unchanged) is governed by flat_rule:
+      'break' — the default, and the rule live since 2026-09-24: a flat newest
+                close returns run 0, and a flat day mid-run ends the run.
+      'skip'  — a flat day neither counts nor breaks; only a move in the
+                opposite direction ends a run. Measured 2026-09-30: one ETF was
+                flat on 5 of 23 sessions, so 'break' chops its runs short.
+    None resolves from bot_config streak.flat_rule, else 'break'.
 
     Only closed sessions count. While the market is open Yahoo's daily frame
     carries today's in-progress bar; it is dropped here because it can still
@@ -621,6 +1138,8 @@ def close_streak(closes, market_open=None, today=None):
     """
     if market_open is None:
         market_open = taiwan_market_open()
+    if flat_rule is None:
+        flat_rule = streak_flat_rule()
     s = pd.Series(closes).dropna()
     if market_open and len(s):
         today = today or datetime.datetime.now(ZoneInfo('Asia/Taipei')).date()
@@ -629,19 +1148,30 @@ def close_streak(closes, market_open=None, today=None):
             s = s.iloc[:-1]
     if len(s) < 2:
         return None
+    last = s.index[-1]
+    as_of = last.date() if hasattr(last, 'date') else None
     vals = s.tolist()
     diffs = [b - a for a, b in zip(vals, vals[1:])]
-    if diffs[-1] == 0:
-        return {'run': 0, 'pct': 0.0}
-    up = diffs[-1] > 0
-    run = 0
-    for d in reversed(diffs):
-        if d == 0 or (d > 0) != up:
+    skip = flat_rule == 'skip'
+
+    newest = next((d for d in reversed(diffs) if d != 0), 0) if skip else diffs[-1]
+    if newest == 0:
+        return {'run': 0, 'pct': 0.0, 'as_of': as_of}
+    up = newest > 0
+    run, start_i = 0, len(diffs)
+    for k in range(len(diffs) - 1, -1, -1):
+        d = diffs[k]
+        if d == 0:
+            if skip:
+                continue
+            break
+        if (d > 0) != up:
             break
         run += 1
-    start = vals[-1 - run]
+        start_i = k            # diffs[k] runs vals[k] -> vals[k+1]; the run began at vals[k]
+    start = vals[start_i]
     pct = (vals[-1] / start - 1.0) * 100 if start else 0.0
-    return {'run': run if up else -run, 'pct': pct}
+    return {'run': run if up else -run, 'pct': pct, 'as_of': as_of}
 
 
 
@@ -1419,6 +1949,259 @@ def format_zhang(volume):
         return str(volume)
 
 
+# ---------------------------------------------------------------------------
+# The 09:05 morning push — exchange real-time prices, nothing yesterday-sourced.
+# Contract: docs/MORNING_REBUILD_2026-10-02.md
+# ---------------------------------------------------------------------------
+
+_OFFICIAL_CLOSE_FILE = 'official_close_cache.json'
+_OFFICIAL_CLOSE_KEEP = 90           # dates retained on disk
+_official_close_mem = None          # {YYYYMMDD: {code: close}}, loaded once per process
+
+
+def _as_date(i):
+    return i.date() if hasattr(i, 'date') else i
+
+
+def _official_close(day, code):
+    """TWSE's own closing price for `code` on `day`, or None.
+
+    One MI_INDEX call covers every listed code for that date, and a past close
+    never changes, so each date is fetched once and kept on disk. A failed or
+    unpublished date is not cached, so it is simply asked again next time."""
+    global _official_close_mem
+    path = os.path.join(DATA_DIR, _OFFICIAL_CLOSE_FILE)
+    if _official_close_mem is None:
+        try:
+            with open(path, encoding='utf-8') as f:
+                _official_close_mem = json.load(f)
+            if not isinstance(_official_close_mem, dict):
+                _official_close_mem = {}
+        except (OSError, ValueError):
+            _official_close_mem = {}
+    key = day.strftime('%Y%m%d')
+    if key not in _official_close_mem:
+        rows = fetch_twse_mi_index(key)
+        closes = {}
+        for r in rows or []:
+            px = _f(r.get('ClosingPrice'))
+            if px is not None and r.get('Code'):
+                closes[str(r['Code'])] = px
+        if not closes:
+            return None
+        _official_close_mem[key] = closes
+        for old in sorted(_official_close_mem)[:-_OFFICIAL_CLOSE_KEEP]:
+            del _official_close_mem[old]
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(path + '.tmp', 'w', encoding='utf-8') as f:
+                json.dump(_official_close_mem, f, ensure_ascii=False)
+            os.replace(path + '.tmp', path)
+        except OSError:
+            pass
+    return _official_close_mem[key].get(str(code))
+
+
+def repair_daily_closes(code, closes, today, prev_close=None, lookback=30):
+    """Daily closes fit to count a streak on, through the last settled session.
+
+    Yahoo's daily frame silently omits whole sessions for Taiwan ETFs. Measured
+    2026-10-02 over 65 sessions: every ETF checked was missing 2026-10-01,
+    while the ordinary stocks checked were missing nothing. A dropped session merges two
+    days into one step, so the run is miscounted — and the streak is the one
+    figure the morning push asks Peter to act on.
+
+    So: bars dated `today` or later are dropped (today is unsettled); any trading
+    day inside the trailing `lookback` sessions that Yahoo lacks is filled from
+    TWSE MI_INDEX; and the newest session is pinned to `prev_close`, the
+    exchange's own 昨收, when one is given.
+    """
+    s = pd.Series(closes).dropna()
+    if s.empty:
+        return s
+    s = s[[_as_date(i) < today for i in s.index]]
+    if s.empty:
+        return s
+    first = _as_date(s.index[0])
+    sessions, day = [], today - datetime.timedelta(days=1)
+    while len(sessions) < lookback and day >= first:
+        if is_trading_day(day):
+            sessions.append(day)
+        day -= datetime.timedelta(days=1)
+
+    have = {_as_date(i) for i in s.index}
+    fill = {}
+    for day in sessions:
+        if day not in have:
+            px = _official_close(day, code)
+            if px is not None:
+                fill[day] = px
+    if prev_close and sessions:
+        fill[sessions[0]] = float(prev_close)
+    if not fill:
+        return s
+
+    s = s.copy()
+    for day, px in fill.items():
+        hit = [i for i in s.index if _as_date(i) == day]
+        if hit:
+            s.loc[hit[-1]] = px
+        else:
+            ts = pd.Timestamp(day)
+            if getattr(s.index, 'tz', None) is not None:
+                ts = ts.tz_localize(s.index.tz)
+            s.loc[ts] = px
+    return s.sort_index()
+
+
+def streak_marker_threshold(cfg=None):
+    """How many sessions a run needs before the morning push flags it ⚡ / ⚠️.
+    bot_config streak.marker_threshold, else streak_alert.threshold, else 3."""
+    cfg = cfg if cfg is not None else load_bot_config()
+    for section, key in (('streak', 'marker_threshold'), ('streak_alert', 'threshold')):
+        try:
+            v = int(((cfg or {}).get(section) or {}).get(key) or 0)
+        except (TypeError, ValueError):
+            v = 0
+        if v > 0:
+            return v
+    return 3
+
+
+def last_pool_record(mode='closing'):
+    """The newest diary/pool.jsonl record for `mode`, or None.
+
+    The morning push carries last night's closing facts forward (📌 昨日重點)
+    from what the closing push already recorded, rather than fetching again."""
+    last = None
+    try:
+        with open(os.path.join(DATA_DIR, 'diary', 'pool.jsonl'), encoding='utf-8') as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get('mode') == mode:
+                    last = rec
+    except OSError:
+        return None
+    return last
+
+
+def _morning_snapshot(cfg):
+    """Everything the 09:05 push prints. Holdings only — the morning push carries
+    no watchlist — and no RSI / 量比 / 融資 / PE: those are all yesterday's at
+    09:05, and last night's closing push already delivered them.
+
+    Prices come from the exchange's own real-time feed. Yahoo fills only codes
+    the exchange cannot price, and every such code is listed in delayed_codes so
+    the push says so instead of presenting a delayed price as live.
+    """
+    portfolio = load_portfolio()
+    codes = list(portfolio)
+    today = datetime.datetime.now(ZoneInfo('Asia/Taipei')).date()
+
+    print(f"[{_now()}] [MORNING] Exchange real-time quotes "
+          f"({len(codes)} holdings + index)...")
+    not_traded = []
+    mis = fetch_mis_quotes(codes, want_index=True, unmatched=not_traded)
+    idx = mis.pop('_t00', None)
+    quotes = dict(mis)
+
+    no_exchange = [c for c in codes if c not in quotes and c not in not_traded]
+    if no_exchange:
+        print(f"[{_now()}] [MORNING] exchange has no price for {', '.join(no_exchange)} "
+              f"— Yahoo (delayed)")
+        for c, q in fetch_live_quotes(no_exchange,
+                                      resolve_symbols(no_exchange, DATA_DIR)).items():
+            q = dict(q)
+            q['src'], q['exch_open'] = 'yahoo', None
+            quotes[c] = q
+    delayed = [c for c in no_exchange if c in quotes]
+    n_mis = sum(1 for q in quotes.values() if q.get('src') == 'mis')
+    price_source = ('none' if not quotes else 'mis' if not delayed
+                    else 'yahoo' if not n_mis else 'mixed')
+    delayed_at = max((quotes[c]['quote_at'] for c in delayed
+                      if quotes[c].get('quote_at')), default=None)
+
+    if idx:
+        taiex_src = 'mis'
+        taiex = {'close': idx['price'], 'last': idx['price'],
+                 'open': idx['today_open'], 'prev_close': idx['prev_close'],
+                 'change': idx['change'],
+                 'pct': (idx['change'] / idx['prev_close'] * 100) if idx['prev_close'] else 0.0}
+    else:
+        taiex_src = 'yahoo'
+        t = fetch_taiex()
+        taiex = dict(t, last=t['close'], prev_close=t['close'] - t['change']) if t else None
+
+    stamps = [q['quote_at'] for q in quotes.values()
+              if q.get('src') == 'mis' and q.get('quote_at')]
+    if idx and idx.get('quote_at'):
+        stamps.append(idx['quote_at'])
+    price_time = max(stamps, default=None)
+
+    print(f"[{_now()}] [MORNING] Overnight global indices...")
+    global_lines = fetch_global_indices(cfg.get('global_indices'))
+
+    positions = compute_positions(portfolio, quotes)
+
+    print(f"[{_now()}] [MORNING] Daily closes for streaks...")
+    flat_rule = streak_flat_rule(cfg)
+    symbol_map = resolve_symbols(codes, DATA_DIR)
+    bars = fetch_history(list(symbol_map.values()), '3mo', '1d') or {}
+    streaks = {}
+    for c in codes:
+        sub = bars.get(symbol_map.get(c))
+        if sub is None or 'Close' not in getattr(sub, 'columns', []):
+            continue
+        q = quotes.get(c) or {}
+        # Only the exchange's 昨收 is trusted to pin the newest session: at 09:05
+        # Yahoo has not rolled over yet, so its previousClose is a day stale.
+        prev = q.get('prev_close') if q.get('src') == 'mis' else None
+        closes = repair_daily_closes(c, sub['Close'], today, prev_close=prev)
+        streaks[c] = close_streak(closes, market_open=False, flat_rule=flat_rule)
+
+    holdings, missing_holdings = [], []
+    for code, pos in portfolio.items():
+        name = pos.get('name', code)
+        q = quotes.get(code)
+        if not q:
+            missing_holdings.append((code, name))
+            continue
+        r = next((x for x in positions['rows'] if x['code'] == code), None)
+        price, prev = q['price'], q['prev_close']
+        change = price - prev if prev else 0.0
+        holdings.append({
+            'code': code, 'name': name, 'pos': pos,
+            'price': price, 'prev_cls': prev, 'open_p': q.get('exch_open'),
+            'change': change, 'pct': (change / prev * 100) if prev else 0.0,
+            'daily_pnl': r['daily_pnl'] if r else None,
+            'stale': r['stale'] if r else False,
+            'src': q.get('src', 'yahoo'), 'quote_at': q.get('quote_at'),
+            'streak': streaks.get(code),
+        })
+
+    now = datetime.datetime.now(ZoneInfo('Asia/Taipei'))   # TZ=UTC under the scheduler
+    return {
+        'mode': 'morning', 'cfg': cfg, 'period_days': None,
+        'date_str': now.strftime('%Y-%m-%d'), 'time_str': now.strftime('%H:%M'),
+        'price_time': price_time, 'price_source': price_source,
+        'delayed_codes': delayed, 'delayed_at': delayed_at, 'not_traded': not_traded,
+        'portfolio': portfolio, 'tracked': {}, 'tracked_notes': {},
+        'taiex': taiex, 'taiex_pct': (taiex['pct'] if taiex else 0.0),
+        'taiex_src': taiex_src,
+        'global_lines': global_lines,
+        'quotes': quotes, 'positions': positions,
+        'holdings': holdings, 'watchlist': [],
+        'missing_holdings': missing_holdings, 'missing_watch': [],
+        'hotlist': {'top_volume': [], 'top_losers': []}, 'news': [],
+        'is_stale': False, 'feed_date': '', 'prev_mismatch': [],
+        'streak_threshold': streak_marker_threshold(cfg), 'flat_rule': flat_rule,
+        'yesterday': last_pool_record('closing'),
+    }
+
+
 def snapshot(mode, cfg=None):
     """EVERYTHING the twice-daily report prints, fetched once and derived once.
 
@@ -1430,6 +2213,10 @@ def snapshot(mode, cfg=None):
     Returns None only when the closing feed is unavailable (caller aborts).
     """
     cfg = cfg if cfg is not None else load_bot_config()
+    if mode == 'morning':
+        # Its own builder since the 09:05 rebuild. Everything below this line is
+        # the closing path, deliberately left exactly as it was.
+        return _morning_snapshot(cfg)
     period_days = cfg.get('technicals', {}).get('period_days', 20)
     opening_mode = (mode == 'morning')
 

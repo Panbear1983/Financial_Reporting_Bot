@@ -183,7 +183,7 @@ if NOW_MODE:
 # ---------------------------------------------------------------------------
 
 # Schedule times loaded from bot_config.json (falls back to hardcoded defaults)
-_morning_utc  = _sched.get('morning_utc',  '01:30')
+_morning_utc  = _sched.get('morning_utc',  '01:05')
 _closing_utc  = _sched.get('closing_utc',  '08:00')
 _streak_utc   = _sched.get('streak_utc',   '08:05')   # after the closing report
 

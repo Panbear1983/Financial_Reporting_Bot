@@ -1,11 +1,12 @@
 """
 TWSE Daily Report — two modes:
-  morning  (01:30 UTC / 09:30 Taiwan): yfinance live prices, no full TWSE scan
+  morning  (01:05 UTC / 09:05 Taiwan): the exchange's own real-time prices (mis.twse.com.tw),
+           holdings only, no AI — see docs/MORNING_REBUILD_2026-10-02.md
   closing  (08:00 UTC / 16:00 Taiwan): TWSE official data once published
 
 Data source rules — ZERO figure hallucination:
   All numbers come from scrapers only.
-  AI (OpenRouter) is called only for explanatory text (原因, 展望, 研究, 推薦).
+  AI (OpenRouter) is called only for the closing push's explanatory text (原因, 研究, 推薦).
 """
 
 import urllib.request
@@ -553,193 +554,189 @@ def ai_closing_commentary(taiex_pct, global_lines, top_vol, top_losers,
 
 
 # ---------------------------------------------------------------------------
-# Morning report (Mode A) — yfinance only
+# Morning report (Mode A) — 09:05, the exchange's own real-time prices
+#
+# Rebuilt 2026-10-02. Contract and the measurements behind it:
+# docs/MORNING_REBUILD_2026-10-02.md. Four blocks, numbers only: the overnight
+# moves and the open, today's holdings, the runs worth acting on (marked inline),
+# and last night's closing facts carried forward. No AI and no yesterday-sourced
+# indicator (RSI / 量比 / 融資 / PE) — at 09:05 those are all yesterday's, and the
+# 16:00 push already delivered them from final data.
 # ---------------------------------------------------------------------------
+
+def _morning_run_lines(h, threshold):
+    """(mark, second line) for one holding: the settled streak, then whether
+    today so far is extending or breaking it.
+
+    Today's move is NEVER folded into the count — at 09:05 the day can still
+    reverse by 13:30. The count is a settled fact through the last close; today
+    is a separate flag beside it, worded 延續 / 中斷 rather than as a verdict."""
+    st = h.get('streak')
+    if not st:
+        return '•', ''
+    asof = f"（至 {st['as_of']:%m/%d} 收盤）" if st.get('as_of') else "（至昨收）"
+    run = st['run']
+    if run == 0:
+        return '•', f"     平盤，無連續走勢{asof}"
+    up = run > 0
+    text = f"     {'連漲' if up else '連跌'} {abs(run)} 日 {st['pct']:+.2f}%{asof}"
+    if abs(run) < threshold:
+        return '•', text
+    move = h['price'] - h['prev_cls'] if h.get('prev_cls') else 0.0
+    if move == 0:
+        return '•', text + "　→ 今日平盤"
+    if (move > 0) == up:
+        tail = f"　→ 今日 {h['pct']:+.2f}%，{'連漲' if up else '連跌'}延續第 {abs(run) + 1} 天"
+        return '⚡', text + tail + (" → 賣出觀察" if up else "")
+    tail = f"　→ 今日 {h['pct']:+.2f}%，{'連漲' if up else '連跌'}中斷"
+    return '⚠️', text + tail + ("" if up else " → 止跌觀察")
+
+
+def _morning_yesterday_lines(rec):
+    """📌 昨日重點 — facts the previous closing push already recorded. No fetch."""
+    if not rec:
+        return []
+    out = [f"📌 昨日重點（{rec.get('date', '')} 收盤）："]
+    out.append(f"• 加權指數 {rec.get('taiex_pct', 0.0):+.2f}%　"
+               f"持倉當日損益 {rec.get('pf_day_pnl', 0.0):+,.0f}元")
+    held = [x for x in (rec.get('holdings') or []) if isinstance(x.get('pct'), (int, float))]
+    if held:
+        movers = sorted({id(x): x for x in (max(held, key=lambda x: x['pct']),
+                                            min(held, key=lambda x: x['pct']))}.values(),
+                        key=lambda x: -x['pct'])
+        for x in movers:
+            reason = (x.get('ai_reason') or '').strip()
+            reason = f" — {reason[:40]}" if reason else ''
+            out.append(f"• {x.get('name', '')} ({x.get('code', '')}) {x['pct']:+.2f}%{reason}")
+    out.append("")
+    return out
+
 
 def generate_morning_report():
     # ── Everything below is the dashboard's. This function renders; it does not
     # fetch and it does not calculate. One call, one set of numbers. ──
+    gate = dashboard.morning_gate()
+    # The scheduler runs this process with TZ=UTC, so every displayed time is
+    # converted to Taipei explicitly — a bare now()/astimezone() prints UTC.
+    tpe = dashboard.ZoneInfo('Asia/Taipei')
+    date_today = datetime.datetime.now(tpe).strftime('%Y-%m-%d')
+    if gate['skip']:
+        # A skipped push must say so: silence reads exactly like a crashed bot.
+        notice = f"📊 {date_today} 台股開盤快報\n⚠️ {gate['reason']}"
+        _save_and_print(notice, DATA_DIR, 'twse_daily_report.md', mode='morning', record=None)
+        return notice
+
     snap = dashboard.snapshot('morning')
-    cfg            = snap['cfg']
-    tracked_notes  = snap['tracked_notes']
-    portfolio      = snap['portfolio']
-    date_str, time_str = snap['date_str'], snap['time_str']
-    output_dir     = DATA_DIR
-    ai_cfg         = cfg.get('ai', {})
-    technicals_cfg = cfg.get('technicals', {})
-    sections       = cfg.get('sections', {}).get('morning', {})
-    taiex, taiex_pct = snap['taiex'], snap['taiex_pct']
-    global_lines   = snap['global_lines']
-    _calc          = snap['positions']
-    _prev_mismatch = snap['prev_mismatch']
+    if snap is None:
+        return None
+    cfg        = snap['cfg']
+    sections   = cfg.get('sections', {}).get('morning', {})
+    calc       = snap['positions']
+    total      = calc['total']
+    threshold  = snap['streak_threshold']
+    date_str   = snap['date_str']
+    names      = {h['code']: h['name'] for h in snap['holdings']}
+    names.update({c: n for c, n in snap['missing_holdings']})
 
-    hold_ctx, watch_ctx = snap['holdings'], snap['watchlist']
-    holding_sections = [l for code, name in snap['missing_holdings']
-                        for l in (f"• **{name} ({code})**：資料暫時無法取得", "")]
-    watch_sections   = [l for code, name in snap['missing_watch']
-                        for l in (f"• **{name} ({code})**：資料暫時無法取得", "")]
-    holdings_data, watch_data, stock_summary = [], [], []
-    # Straight off the shared calculation — the same totals the board's Total row shows.
-    pf_daily_total = _calc['total']['daily_pnl']
-    pf_gain_total  = _calc['total']['pnl']
-    pf_cost_total  = _calc['total']['cost']
+    pf_daily_total = total['daily_pnl']
+    pf_gain_total  = total['pnl']
+    pf_cost_total  = total['cost']
 
-    # One batched AI call for every 展望 (holdings + watchlist) — cross-stock aware.
-    # Its only inputs are the dashboard's numbers: the analysis reasons about
-    # what the board shows, never about data fetched behind the board's back.
-    print(f"[{_now()}] [MORNING] AI 展望 (batched, {len(hold_ctx) + len(watch_ctx)} stocks)...")
-    _reasons = ai_stock_reasons_batch(hold_ctx + watch_ctx, taiex_pct, cfg)
-
-    # Pass 2 — render holdings
-    for c in hold_ctx:
-        code, name = c['code'], c['name']
-        reason = _reasons.get(code, '')
-        price, prev_cls, change, pct = c['price'], c['prev_cls'], c['change'], c['pct']
-        direction = '漲' if change >= 0 else '跌'
-        line = (
-            f"• **{name} ({code})**：目前 {price:,.1f}元"
-            f" [昨收 {prev_cls:,.1f} | {direction}{abs(change):.1f}元 ({pct:+.2f}%)]"
-        )
-        if reason:
-            line += f"\n  展望：{reason}"
-        line += _stock_note(cfg, code)
-        holding_sections.append(line)
-        holding_sections.append("")
-        holdings_data.append(_stock_row(
-            code, name, price, change, pct, c['rsi'], c['vol_ratio'], reason,
-            (cfg.get('notes') or {}).get(str(code), ''), valuation=c.get('val')))
-        stock_summary.append(f"{name}({code}) {direction}{abs(pct):.1f}%")
-
-    # Pass 2 — render watchlist
-    for c in watch_ctx:
-        code, name = c['code'], c['name']
-        reason = _reasons.get(code, '')
-        price, prev_cls, change, pct = c['price'], c['prev_cls'], c['change'], c['pct']
-        direction = '漲' if change >= 0 else '跌'
-        line = (
-            f"• **{name} ({code})**：目前 {price:,.1f}元"
-            f" [昨收 {prev_cls:,.1f} | {direction}{abs(change):.1f}元 ({pct:+.2f}%)]"
-        )
-        line += _returns_line(code, c['rets'])
-        if reason:
-            line += f"\n  展望：{reason}"
-        if c['note']:
-            line += f"\n  📝 備註：{c['note']}"
-        watch_sections.append(line)
-        watch_sections.append("")
-        watch_data.append(_stock_row(
-            code, name, price, change, pct, c['rsi'], c['vol_ratio'], reason,
-            c['note'], returns=c['rets'], valuation=c.get('val')))
-
-    print(f"[{_now()}] [MORNING] Generating AI outlook...")
-    outlook = ai_morning_outlook(
-        taiex_pct, global_lines, stock_summary,
-        max_tokens=ai_cfg.get('max_tokens_outlook', 200),
-        model=ai_cfg.get('model', 'anthropic/claude-haiku-3-5'),
-    )
-
-    # Portfolio summary line (only shown if user has real positions)
-    pf_summary = ''
-    if pf_cost_total > 0:
-        d_sign = '+' if pf_daily_total >= 0 else ''
-        t_sign = '+' if pf_gain_total  >= 0 else ''
-        pf_total_pct = pf_gain_total / pf_cost_total * 100
-        pf_summary = (
-            f"💰 今日持倉：今日損益 {d_sign}{pf_daily_total:,.0f}元"
-            f" | 持倉總損益 {t_sign}{pf_gain_total:,.0f}元 ({pf_total_pct:+.1f}%)"
-        )
-        # A partial total must never read as the market moving.
-        if _calc['n_unpriced']:
-            pf_summary += (f"\n⚠️ 僅含 {_calc['total']['n_priced']}/{_calc['total']['n_total']} "
-                           f"檔（其餘無報價，未計入）")
-        if _prev_mismatch:
-            pf_summary += f"\n⚠️ 昨收與交易所紀錄不符：{'、'.join(_prev_mismatch)}"
-
-    # Assemble — build each section block, then emit in the configured order
     blocks = {}
 
-    mov = ["市場總覽："]
-    if taiex:
-        mov.append(f"• 加權指數：{taiex['open']:,.0f} 點（開盤參考）")
-        mov.append(f"• 昨收漲跌：{taiex_pct:+.2f}%")
-        mov.append(f"• 市場情緒：{get_market_sentiment(taiex_pct)}")
-    else:
-        mov.append("• 加權指數：資料暫時無法取得")
-    mov.append("")
-    blocks['market_overview'] = mov
+    # 🌙 the overnight moves and the open
+    ov = ["🌙 隔夜與開盤："]
+    t = snap['taiex']
+    if sections.get('market_overview', True):
+        if t:
+            late = '（延遲）' if snap['taiex_src'] != 'mis' else ''
+            ov.append(f"• 加權指數：昨收 {t['prev_close']:,.0f} → 開盤 {t['open']:,.0f}"
+                      f" → 現 {t['last']:,.0f}（{t['pct']:+.2f}%）{late}")
+        else:
+            ov.append("• 加權指數：資料暫時無法取得")
+    if sections.get('global_markets', True):
+        ov.extend(snap['global_lines'])
+    ov.append("")
+    if len(ov) > 2:
+        blocks['overnight'] = ov
 
-    gm = ["🌐 全球市場（上一交易日收盤）："]
-    gm.extend(global_lines)
-    gm.append("")
-    blocks['global_markets'] = gm
-
-    hold = ["🎯 **持倉：**"]
-    if pf_summary and sections.get('cost_line', True):
-        hold.append(pf_summary)
-        hold.append("")
-    hold.extend(holding_sections)
+    # 🎯 today's holdings, each with its run
+    hold = ["🎯 **持倉（今日）：**"]
+    if pf_cost_total > 0 and sections.get('cost_line', True):
+        hold.append(f"💰 今日損益 {pf_daily_total:+,.0f}元 ｜ 總損益 {pf_gain_total:+,.0f}元"
+                    f" ({pf_gain_total / pf_cost_total * 100:+.1f}%)")
+        if calc['n_unpriced']:
+            hold.append(f"⚠️ 僅含 {total['n_priced']}/{total['n_total']} 檔"
+                        f"（其餘尚無報價，未計入）")
+        hold.extend(_cash_lines(total))
     hold.append("")
-    blocks['holdings'] = hold
+    for h in snap['holdings']:
+        mark, run_line = _morning_run_lines(h, threshold)
+        op = f"{h['open_p']:,.2f}" if h.get('open_p') is not None else '—'
+        late = '（延遲）' if h.get('src') != 'mis' else ''
+        dp = h.get('daily_pnl')
+        dp = f"　今日 {dp:+,.0f}元" if dp is not None else ''
+        hold.append(f"{mark} {h['name']} ({h['code']})：{h['prev_cls']:,.2f} → 開 {op}"
+                    f" → 現 {h['price']:,.2f}{late}　{h['pct']:+.2f}%{dp}")
+        if run_line:
+            hold.append(run_line)
+    for code, name in snap['missing_holdings']:
+        why = '尚未成交' if code in snap.get('not_traded', []) else '暫無報價'
+        hold.append(f"• {name} ({code})：{why}")
+    hold.append("")
+    if sections.get('holdings', True):
+        blocks['holdings'] = hold
 
-    if watch_sections:
-        wl = ["👁 **觀察清單：**", ""]
-        wl.extend(watch_sections)
-        wl.append("")
-        blocks['watchlist'] = wl
-
-    if outlook:
-        blocks['ai_outlook'] = [f"💡 開盤展望：\n{outlook}"]
+    # 📌 last night's closing facts, carried forward
+    yl = _morning_yesterday_lines(snap.get('yesterday'))
+    if yl and sections.get('yesterday', True):
+        blocks['yesterday'] = yl
 
     lines = []
     style_header = _style_text(cfg, 'header')
     if style_header:
         lines.append(style_header)
         lines.append("")
-    lines.append(f"📊 {date_str} 台股開盤快報（{time_str} 數據）")
-    lines.append(f"⚠️ 數據來源：Yahoo Finance（TWSE官方數據於收盤後發布）")
+    lines.append(f"📊 {date_str} 台股開盤快報")
+    pt = snap.get('price_time')
+    if snap['price_source'] in ('mis', 'mixed') and pt:
+        # The PRICE time — not the build time, which the old header printed and
+        # which overstated freshness by up to 20 minutes.
+        lines.append(f"🕐 價格時間 {pt.astimezone(tpe):%H:%M:%S}（證交所即時）")
+    if snap['delayed_codes']:
+        at = snap.get('delayed_at')
+        at = f"，最後成交 {at.astimezone(tpe):%m/%d %H:%M}" if at else ''
+        if snap['price_source'] == 'yahoo':
+            lines.append(f"⚠️ 證交所即時報價暫時無法取得 — 以下全部為 Yahoo 延遲報價{at}，"
+                         f"可能仍是前一交易日的數字")
+        else:
+            lines.append(f"⚠️ 延遲報價：{'、'.join(names.get(c, c) for c in snap['delayed_codes'])}"
+                         f"（證交所無即時報價，改用 Yahoo{at}）")
     lines.append("")
-    morning_order = cfg.get('sections', {}).get('morning_order')
-    for key in _resolve_section_order(
-            morning_order,
-            ['market_overview', 'global_markets', 'holdings', 'watchlist', 'ai_outlook']):
-        if sections.get(key, True) and key in blocks:
+    # The dashboard orders the toggles it shows; the index and global lines
+    # share one block now, and the total line lives inside the holdings block.
+    as_block = {'market_overview': 'overnight', 'global_markets': 'overnight',
+                'cost_line': 'holdings'}
+    order = [as_block.get(k, k) for k in (cfg.get('sections', {}).get('morning_order') or [])]
+    for key in _resolve_section_order(order, ['overnight', 'holdings', 'yesterday']):
+        if key in blocks:
             lines.extend(blocks[key])
-
-    _summary = ''
-    if sections.get('report_summary', True):
-        # Scrub manual 📝 notes (watchlist 備註 + holdings note) — a static thesis must
-        # not contaminate analysis of a fluid market. Notes still print in the report.
-        _clean = "\n".join(l for l in "\n".join(lines).split("\n")
-                           if not l.lstrip().startswith("📝"))
-        _digest = _summary_digest(watch_data, holdings_data, {
-            'taiex_pct': taiex_pct, 'pf_cost_total': pf_cost_total,
-            'pf_value_total': pf_cost_total + pf_gain_total, 'pf_gain_total': pf_gain_total,
-            'pf_total_pct': (pf_gain_total / pf_cost_total * 100) if pf_cost_total else 0.0,
-            'pf_day_pnl': pf_daily_total,
-        }, technicals_cfg)
-        _hist = _history_digest(
-            _load_pool_history(output_dir, 'morning', ai_cfg.get('summary_history_days', 5)),
-            {'date': date_str, 'taiex_pct': taiex_pct,
-             'pf_total_pct': (pf_gain_total / pf_cost_total * 100) if pf_cost_total else 0.0},
-            watch_data)
-        _summary = ai_report_summary(_clean, cfg, digest=_digest, history=_hist)
-        if _summary:
-            lines.append("")
-            lines.append("📋 **報告總結（AI 分析師）：**")
-            lines.append(_summary)
 
     style_footer = _style_text(cfg, 'footer')
     if style_footer:
         lines.append("")
         lines.append(style_footer)
 
-    report = "\n".join(lines)
+    report = "\n".join(lines).rstrip() + "\n"
+    holdings_data = [
+        _stock_row(h['code'], h['name'], h['price'], h['change'], h['pct'], None, None, '',
+                   (cfg.get('notes') or {}).get(str(h['code']), ''))
+        for h in snap['holdings']]
     record = _build_pool_record(
-        'morning', date_str, taiex_pct,
+        'morning', date_str, snap['taiex_pct'],
         pf_daily_total, pf_gain_total, pf_cost_total,
-        holdings_data, watch_data,
-        ai_summary=_summary, ai_commentary=(outlook or ''), news=[])
-    _save_and_print(report, output_dir, 'twse_daily_report.md', mode='morning', record=record)
+        holdings_data, [], ai_summary='', ai_commentary='', news=[])
+    _save_and_print(report, DATA_DIR, 'twse_daily_report.md', mode='morning', record=record)
     return report
 
 
@@ -879,6 +876,7 @@ def generate_closing_report():
     hold = ["**持倉：**"]
     if pf_summary and sections.get('cost_line', True):
         hold.append(pf_summary)
+        hold.extend(_cash_lines(_calc['total']))
         hold.append("")
     hold.extend(holding_sections)
     hold.append("")
@@ -930,7 +928,7 @@ def generate_closing_report():
         # Scrub manual 📝 notes (watchlist 備註 + holdings note) — a static thesis must
         # not contaminate analysis of a fluid market. Notes still print in the report.
         _clean = "\n".join(l for l in "\n".join(lines).split("\n")
-                           if not l.lstrip().startswith("📝"))
+                           if not l.lstrip().startswith(("📝", "🏦", "⚠️ 現金")))
         _digest = _summary_digest(watch_data, holdings_data, {
             'taiex_pct': taiex_pct, 'pf_cost_total': pf_cost_total,
             'pf_value_total': pf_cost_total + pf_gain_total, 'pf_gain_total': pf_gain_total,
@@ -960,6 +958,7 @@ def generate_closing_report():
         pf_daily_total, pf_gain_total, pf_cost_total,
         holdings_data, watch_data,
         ai_summary=_summary, ai_commentary=_commentary, news=brave_headlines or [])
+    record.update(_cash_record(_calc['total']))
     _save_and_print(report, output_dir, 'twse_daily_report.md', mode='closing', record=record)
     return report
 
@@ -1121,6 +1120,46 @@ def _history_digest(history, today_ctx, today_watch, max_names=15):
         out.append("觀察清單近日漲跌%:")
         out.extend(rows)
     return "\n".join(out)
+
+
+def _cash_lines(total):
+    """🏦 brokerage cash, total wealth and the stock/cash split — or nothing at
+    all when no cash ledger exists, so a cash-free push is byte-identical to the
+    pushes before cash existed.
+
+    Placed AFTER the 💰 line and its ⚠️ notes on purpose: the voice reads the 💰
+    line, then ⚠️ lines, and stops at the first other line, so cash is never
+    spoken; and the closing AI input scrubs 🏦 / ⚠️ 現金 lines. Cash never enters
+    a performance number — only a balance, a total and a share of that total."""
+    if total.get('cash') is None:
+        return []
+    line = f"🏦 交割戶現金 {total['cash']:,.0f}元（{total.get('cash_as_of') or '?'} 更新）"
+    if total.get('allocation_valid'):
+        line += (f" ｜ 總資產 {total['total_wealth']:,.0f}元"
+                 f"（股票 {total['equity_pct']:.1f}% · 現金 {total['cash_pct']:.1f}%）")
+    else:
+        line += " ｜ 總資產暫不顯示（尚有持股無報價）"
+    out = [line]
+    if total.get('cash_stale'):
+        out.append(f"⚠️ 現金餘額已 {total['cash_age_days']} 天未更新 — 總資產與比例可能失真")
+    if total.get('cash_bad_lines'):
+        out.append(f"⚠️ 現金帳本有 {total['cash_bad_lines']} 行無法讀取，餘額僅計可讀部分")
+    return out
+
+
+def _cash_record(total):
+    """The day's wealth, for the closing pool record — the history that a future
+    total-wealth chart and return will be built on. Empty with no ledger, so the
+    record keeps its old shape; metrics.csv is never widened."""
+    if total.get('cash') is None:
+        return {}
+    return {
+        'cash': round(total['cash'], 2),
+        'cash_as_of': total.get('cash_as_of'),
+        'cash_net_flow': round(total.get('cash_net_flow') or 0.0, 2),
+        'total_wealth': (round(total['total_wealth'], 2)
+                         if total.get('total_wealth') is not None else None),
+    }
 
 
 def _build_pool_record(mode, date_str, taiex_pct, pf_day_pnl, pf_gain_total,
