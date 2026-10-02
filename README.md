@@ -25,8 +25,8 @@ Automated Taiwan-market reporting for OpenClaw: a scheduled TWSE/TPEX intelligen
   Full contract and measurements: `docs/MORNING_REBUILD_2026-10-02.md`.
 - **Brokerage cash ledger.** Dashboard → Portfolio → `[c] Cash`: an append-only record of the
   settlement account (opening balance, deposits, withdrawals, balance updates), each with a date and a
-  note. Both pushes and the live board show cash, total wealth and the stock/cash split — and cash
-  never enters any P/L figure. Lives in `data/cash_ledger.jsonl` (gitignored).
+  note. The live board shows cash, total wealth and the stock/cash split — and cash never enters any
+  P/L figure. The Telegram pushes leave cash out unless `bot_config` sets `cash.in_push: true`. Lives in `data/cash_ledger.jsonl` (gitignored).
 - **Opening-gap arrows on the live board.** During the session the Streak column shows ▲ / ▼ when a
   holding opened ≥0.3% above / below yesterday's close (exchange prices) — measured to call the close
   ~4 times in 5. The board's streak count is repaired from the exchange where Yahoo drops sessions.

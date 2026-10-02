@@ -672,7 +672,8 @@ def generate_morning_report():
         if calc['n_unpriced']:
             hold.append(f"⚠️ 僅含 {total['n_priced']}/{total['n_total']} 檔"
                         f"（其餘尚無報價，未計入）")
-        hold.extend(_cash_lines(total))
+        if _cash_in_push(cfg):
+            hold.extend(_cash_lines(total))
     hold.append("")
     for h in snap['holdings']:
         mark, run_line = _morning_run_lines(h, threshold, snap.get('open_gap_min', 0.0))
@@ -880,7 +881,8 @@ def generate_closing_report():
     hold = ["**持倉：**"]
     if pf_summary and sections.get('cost_line', True):
         hold.append(pf_summary)
-        hold.extend(_cash_lines(_calc['total']))
+        if _cash_in_push(cfg):
+            hold.extend(_cash_lines(_calc['total']))
         hold.append("")
     hold.extend(holding_sections)
     hold.append("")
@@ -1149,6 +1151,14 @@ def _cash_lines(total):
     if total.get('cash_bad_lines'):
         out.append(f"⚠️ 現金帳本有 {total['cash_bad_lines']} 行無法讀取，餘額僅計可讀部分")
     return out
+
+
+def _cash_in_push(cfg):
+    """Whether the 🏦 cash line goes out in the Telegram pushes. OFF unless
+    bot_config cash.in_push is true: Peter's rule (2026-10-02) is that his cash
+    never goes on the internet, and Telegram is the internet. The dashboard shows
+    cash regardless, and the closing pool record keeps the day's wealth locally."""
+    return bool(((cfg or {}).get('cash') or {}).get('in_push', False))
 
 
 def _cash_record(total):

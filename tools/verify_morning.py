@@ -191,11 +191,9 @@ morning = ("📊 2026-10-05 台股開盤快報\n🕐 價格時間 09:05:12（證
            "⚡ 甲 (0001)：1.00 → 開 1.00 → 現 1.10　+10.00%　今日 +1元\n"
            "     連漲 5 日 +9.15%（至 10/02 收盤）　→ 今日 +10.00%，連漲延續第 6 天 → 賣出觀察\n"
            "• 乙 (0002)：1.00 → 開 1.00 → 現 1.00　+0.00%　今日 +0元\n     連漲 1 日 +1.00%（至 10/02 收盤）\n")
-spoken = rv.for_speech(morning)
-check('morning voice is shorter than the report', len(spoken) < len(morning))
-check('morning voice includes the run marker', '⚡ 甲 (0001) 連漲 5 日' in spoken)
-check('morning voice never speaks cash', '🏦' not in spoken)
-check('morning voice skips unflagged holdings', '乙' not in spoken)
+check('the morning voice reads the whole push', rv.for_speech(morning) == morning)
+check('cash stays off Telegram unless bot_config cash.in_push is true',
+      t._cash_in_push({}) is False and t._cash_in_push({'cash': {'in_push': True}}) is True)
 
 if not OFFLINE:
     # 9. Live: the exchange feed and the whole morning snapshot (read-only).

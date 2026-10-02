@@ -336,3 +336,12 @@ What shipped:
 - **The morning push's ⚡ / ⚠️ verdict now also needs a ≥0.3% move**; below it the line reads
   「→ 今日 ±x%，變動不大」 instead of calling a coin flip.
 - Checks: `tools/verify_morning.py`, 53 passing.
+
+## Later the same night — voice and cash-on-Telegram
+
+- **The morning voice now reads the whole push** (Peter, 2026-10-02: "The voice message can actually
+  read the entire push. No problem."). The push is ~1,200 characters with no AI. The closing voice
+  still reads its slice and is unchanged.
+- **Cash is OFF the Telegram pushes by default** (`bot_config` `cash.in_push`, default false). Peter's
+  rule is that his cash never goes on the internet, and the pushes go to a Telegram group. The live
+  board still shows cash, and closing pool records still keep the day's wealth locally.

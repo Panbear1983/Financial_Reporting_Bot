@@ -55,47 +55,6 @@ def _load_voice_module():
     return None, f"botffet_voice.py not found (looked in: {looked})"
 
 
-RUN_MARKS = ('⚡', '⚠️')
-
-
-def _morning_speech(lines):
-    """The 09:05 push's spoken slice: the date, the price time and any delayed-
-    prices warning, the index, the portfolio total, and the runs worth acting on.
-
-    Agreed 2026-10-02. The rebuilt morning push has no 市場總覽 block and no AI
-    summary to anchor on, and for_speech's closing logic falls back to reading
-    the WHOLE report when the summary is missing — measured at 1,174 of 1,174
-    characters on the new layout. A run is a holding line whose mark (⚡ / ⚠️)
-    sits at column zero, followed by its indented run line; only the name and
-    the run are spoken, never the prices, which are on screen above the bubble.
-    """
-    out = []
-    for i, l in enumerate(lines):
-        if l.startswith('📊'):
-            out.append(l)
-            for nxt in lines[i + 1:]:
-                if not nxt.startswith(('🕐', '⚠️')):
-                    break
-                out.append(nxt)
-            break
-    idx = next((l for l in lines if l.startswith('• 加權指數')), None)
-    if idx:
-        out.append(idx)
-    for i, l in enumerate(lines):
-        if l.startswith('💰'):
-            out.append(l)
-            for nxt in lines[i + 1:]:
-                if not nxt.startswith('⚠️'):
-                    break
-                out.append(nxt)
-            break
-    for i, l in enumerate(lines):
-        nxt = lines[i + 1] if i + 1 < len(lines) else ''
-        if l.startswith(RUN_MARKS) and nxt.startswith('     '):
-            out.append(l.split('：', 1)[0] + ' ' + nxt.strip())
-    return '\n'.join(out).strip()
-
-
 def for_speech(text):
     """The listenable slice of a push: the date line, the market overview, the
     portfolio's daily and total P&L, and the AI analyst's summary.
@@ -114,7 +73,9 @@ def for_speech(text):
     lines = (text or '').splitlines()
     head = next((l for l in lines if l.startswith('📊')), '')
     if '開盤快報' in head:
-        return _morning_speech(lines) or text
+        # The 09:05 push is short (~1,200 characters, no AI) and Peter asked for
+        # all of it to be read (2026-10-02). The closing push keeps the slice.
+        return text
     out = []
 
     for i, l in enumerate(lines):
