@@ -210,7 +210,7 @@ try:
               + (f"{_n} closed days cached" if _n else "not published yet"), flush=True)
 except Exception as _exc:                                          # noqa: BLE001
     print(f"  - Holiday calendar warm-up skipped: {type(_exc).__name__}: {_exc}", flush=True)
-print(f"  - TWSE morning:   {_morning_utc} UTC — weekdays, yfinance live", flush=True)
+print(f"  - TWSE morning:   {_morning_utc} UTC — weekdays, exchange real-time (mis.twse.com.tw)", flush=True)
 print(f"  - TWSE closing:   {_closing_utc} UTC — weekdays, TWSE official", flush=True)
 print(f"  - Streak alert:   {_streak_utc} UTC — weekdays, holdings on a 3+ session run", flush=True)
 
