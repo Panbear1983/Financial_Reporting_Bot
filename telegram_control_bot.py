@@ -196,7 +196,7 @@ def cmd_status(chat_id: str, _parts: list) -> None:
         f"Tracked stocks: {len(stocks)}\n"
         f"Portfolio positions: {len(portfolio)}\n\n"
         "*Schedule (UTC)*\n"
-        "• Morning:   01:30 (09:30 Taiwan)\n"
+        "• Morning:   01:05 (09:05 Taiwan)\n"
         "• Closing:   08:00 (16:00 Taiwan)"
     ))
 

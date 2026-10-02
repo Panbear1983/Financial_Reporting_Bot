@@ -7,11 +7,12 @@ Interactive terminal UI scoped to the single TWSE daily-report cron routine
 structure, timing, AI, or delivery.
 
 Panels: Portfolio (+CSV import) · Watchlist · Report Schedule · Layout & Content ·
-        AI & Indicators · Preview & Send · Delivery & Keys
+        AI & Indicators · Preview & Send · Delivery & Keys · Market Diary ·
+        Daemon Control (Docker scheduler: status/logs/go-live/stop)
 
 Run:
     python3 config_tui.py
-    OPENCLAW_DATA_DIR=/path/to/data python3 config_tui.py
+    FRB_DATA_DIR=/path/to/data python3 config_tui.py
 """
 
 import json
@@ -45,16 +46,31 @@ console = Console()
 SCRIPT_DIR = Path(__file__).parent
 
 def _resolve_data_dir():
-    """Find the persistent config/data directory."""
+    """Find the persistent config/data directory.
+
+    Prefer a dir that actually holds portfolio.json (a real silo). This matters
+    because `_config_path()` in the report falls back to the repo root, which ships
+    tracked_stocks.json but NOT portfolio.json — so a stray launch against an empty
+    dir would silently load the watchlist and drop every holding. Pick the real silo.
+    """
     candidates = []
-    env = os.getenv('OPENCLAW_DATA_DIR', '')
+    env = os.getenv('FRB_DATA_DIR', '')
     if env:
         candidates.append(Path(env))
     candidates += [
+        # Known silo homes on this machine (live/push silo FIRST) so a bare launch
+        # auto-resolves to real data instead of an empty repo-local dir.
+        Path.home() / 'Agents' / 'openclaw' / 'agents' / 'financial-bot' / 'data',
+        Path.home() / 'Agents' / 'openclaw' / 'openclaw-infra' / 'agents' / 'financial-bot' / 'data',
         SCRIPT_DIR / 'data',
         Path.home() / 'openclaw-infra' / 'agents' / 'financial-bot' / 'data',
         Path('/app/data'),
     ]
+    # 1st choice: an existing dir that actually contains portfolio.json (a real silo)
+    for p in candidates:
+        if p.exists() and p.is_dir() and (p / 'portfolio.json').exists():
+            return p
+    # 2nd: any existing dir (config may live only in the repo-root fallback)
     for p in candidates:
         if p.exists() and p.is_dir():
             return p
@@ -63,6 +79,9 @@ def _resolve_data_dir():
     return first
 
 DATA_DIR  = _resolve_data_dir()
+# True when the resolved data dir has no portfolio.json — holdings would be empty.
+# main_menu() surfaces a loud warning so this can't fail silently (the "watchlist-only" bug).
+DATA_DIR_HAS_PORTFOLIO = (DATA_DIR / 'portfolio.json').exists()
 DOWNLOADS = Path.home() / 'Downloads'
 
 # Dedicated home for brokerage import CSVs — files found elsewhere (e.g. ~/Downloads)
@@ -73,7 +92,7 @@ IMPORT_DIR = SCRIPT_DIR / 'Import CSV'
 def _resolve_env_path():
     """Find the canonical .env file (outside DATA_DIR, sibling to it on disk)."""
     candidates = [
-        Path(os.getenv('OPENCLAW_ENV_FILE', '')) if os.getenv('OPENCLAW_ENV_FILE') else None,
+        Path(os.getenv('FRB_ENV_FILE', '')) if os.getenv('FRB_ENV_FILE') else None,
         DATA_DIR.parent / '.env',
         Path.home() / 'openclaw-infra' / 'agents' / 'financial-bot' / '.env',
         SCRIPT_DIR / '.env',
@@ -384,6 +403,8 @@ def main_menu():
                   f'Telegram · OpenRouter · Brave ({ENV_PATH.name})')
         t.add_row('[8]', 'Market Diary',
                   'browse archived reports · year/month/date')
+        t.add_row('[9]', 'Daemon Control',
+                  'Docker scheduler · status · logs · ⚠ go-live/stop')
         t.add_row('[q]', 'Quit', '')
         # Anchor the app-wide uniform title-box width to this (widest) home table,
         # so every page that follows draws an identically sized box.
@@ -391,8 +412,15 @@ def main_menu():
         _UNIFORM_WIDTH = _measure(t)
         header('TWSE Daily Report — orchestration')
         console.print(t)
+        console.print(f'[dim]data dir: {DATA_DIR}[/dim]')
+        if not DATA_DIR_HAS_PORTFOLIO:
+            console.print(
+                '[bold red]⚠ No portfolio.json in this data dir — HOLDINGS WILL BE EMPTY '
+                '(watchlist-only reports).[/bold red]\n'
+                '[yellow]  Launch via [bold]~/Agents/agents-ctl tui[/bold] (or set '
+                'FRB_DATA_DIR to your silo) so the report sees your holdings.[/yellow]')
 
-        choice = Prompt.ask('\nSelect', choices=['1','2','3','4','5','6','7','8','q'], default='q')
+        choice = Prompt.ask('\nSelect', choices=['1','2','3','4','5','6','7','8','9','q'], default='q')
 
         if   choice == '1': menu_portfolio()
         elif choice == '2': menu_watchlist()
@@ -402,6 +430,7 @@ def main_menu():
         elif choice == '6': menu_sandbox()
         elif choice == '7': menu_api_keys()
         elif choice == '8': menu_diary()
+        elif choice == '9': menu_daemon()
         else:
             console.print('\n[dim]Goodbye.[/dim]\n')
             break
@@ -546,7 +575,9 @@ def menu_diary():
 # ---------------------------------------------------------------------------
 
 def _build_portfolio_table(portfolio):
-    t = Table(title='Portfolio Holdings', box=box.ROUNDED, show_lines=True)
+    # expand=True: span the full terminal width (flush left and right) instead of
+    # hugging the content; re-fits to the current width each time it is drawn.
+    t = Table(title='Portfolio Holdings', box=box.ROUNDED, show_lines=True, expand=True)
     t.add_column('#',             style='dim',         width=4,  justify='right')
     t.add_column('Code',          style='bold cyan',   width=8)
     t.add_column('Name',                               width=16)
@@ -577,18 +608,146 @@ def menu_portfolio():
         header('Portfolio Holdings')
         _portfolio_table(portfolio)
 
-        console.print('\n[cyan][a][/cyan] Add  [cyan][e][/cyan] Edit  '
-                      f'[cyan][d][/cyan] Delete  [cyan][i][/cyan] Import CSV ({import_count})  '
-                      '[cyan][m][/cyan] Mappings  [cyan][g][/cyan] Graphs  [cyan][b][/cyan] Back')
-        choice = Prompt.ask('Action', choices=['a','e','d','i','m','g','b'], default='b')
+        cs = _dashboard().cash_status()
+        cash_tag = (f'{cs["balance"]:,.0f}元' if cs and cs.get('balance') is not None
+                    else 'not set')
+        console.print('\n[cyan]\\[a][/cyan] Add  [cyan]\\[e][/cyan] Edit  '
+                      f'[cyan]\\[d][/cyan] Delete  [cyan]\\[i][/cyan] Import CSV ({import_count})  '
+                      f'[cyan]\\[c][/cyan] Cash ({cash_tag})  '
+                      '[cyan]\\[m][/cyan] Mappings  [cyan]\\[g][/cyan] Graphs  [cyan]\\[b][/cyan] Back')
+        choice = Prompt.ask('Action', choices=['a','e','d','i','c','m','g','b'], default='b')
 
         if   choice == 'a': _portfolio_add(portfolio)
+        elif choice == 'c': menu_cash()
         elif choice == 'e': _portfolio_edit(portfolio)
         elif choice == 'd': _portfolio_delete(portfolio)
         elif choice == 'i': menu_import_csv()
         elif choice == 'm': _menu_name_mappings()
         elif choice == 'g': _menu_graphs(portfolio)
         else: break
+
+
+def _dashboard():
+    """The data layer, pointed at the SAME data folder this dashboard edits.
+
+    dashboard.py picks its folder from FRB_DATA_DIR or the repo's data/, while
+    this screen resolves DATA_DIR its own way. Cash must land beside the
+    portfolio it belongs to, so the data layer is pointed here explicitly."""
+    import dashboard
+    if os.path.abspath(str(dashboard.DATA_DIR)) != os.path.abspath(str(DATA_DIR)):
+        dashboard.DATA_DIR = str(DATA_DIR)
+        dashboard._cash_cache['key'] = None
+    return dashboard
+
+
+_CASH_HELP = {
+    'open':     ('Opening balance your broker shows (元)',
+                 'Day zero — total-wealth history counts from here. Set once only.'),
+    'deposit':  ('Amount deposited from outside (元)',
+                 'New money in, e.g. salary. Never counted as a gain.'),
+    'withdraw': ('Amount withdrawn to spend (元)',
+                 'Money taken out, e.g. living costs. Never counted as a loss.'),
+    'update':   ('Balance your broker shows now (元)',
+                 'The difference counts as investment result — a dividend, a sale settling, a fee.'),
+}
+
+
+def _cash_entry(d, kind, note_default=''):
+    """Ask for one ledger entry and record it. Entries are final: a mistake is
+    fixed by adding a correcting entry, never by editing — that is what keeps
+    the ledger a track record."""
+    label = d.CASH_TYPE_LABEL[kind]
+    ask, explain = _CASH_HELP[kind]
+    console.print(f'\n[bold]{label}[/bold]  [dim]{explain}[/dim]')
+    value = Prompt.ask(ask)
+    day = Prompt.ask('Date (YYYY-MM-DD)', default=d._taipei_today().isoformat())
+    note = Prompt.ask('Note 備註 — the reason' + ('' if kind == 'open' else ' (required)'),
+                      default=note_default or ('初始餘額' if kind == 'open' else None))
+    console.print(f'[dim]Will record: {label} {value} on {day} — {note or ""}. '
+                  f'Entries cannot be edited or deleted afterwards.[/dim]')
+    if not Confirm.ask('Record it?', default=True):
+        return None
+    try:
+        e = d.add_cash_entry(kind, value, note, day)
+    except ValueError as x:
+        console.print(f'[red]✗ {x}[/red]')
+        return None
+    console.print(f"[green]✓ #{e['id']} {label} {e['amount']:+,.0f}元 → "
+                  f"balance {e['balance_after']:,.0f}元[/green]")
+    return e
+
+
+def menu_cash():
+    """Brokerage settlement-account cash (交割戶): the ledger, and new entries.
+
+    Cash never enters a performance number — the reports and the board show it
+    only as a balance, total wealth and the stock/cash split."""
+    d = _dashboard()
+    while True:
+        header('Brokerage Cash 交割戶現金')
+        entries, bad = d.load_cash_ledger()
+        st = d.cash_status()
+        opened = bool(st and st.get('balance') is not None)
+        if opened:
+            console.print(f"Balance [bold yellow]{st['balance']:,.0f}元[/bold yellow] · "
+                          f"opened {st['opened']} · last updated {st['as_of']} "
+                          f"({st['age_days']} day(s) ago)")
+            console.print(f"[dim]Your own deposits − withdrawals since opening: "
+                          f"{st['net_flow']:+,.0f}元 (excluded from any gain)[/dim]")
+            if st['stale']:
+                console.print(f'[yellow]⚠ not updated for over {d.CASH_STALE_DAYS} days — '
+                              f'the reports flag it[/yellow]')
+        else:
+            console.print('[dim]No cash recorded yet. Start with \\[o]: the opening balance is '
+                          'day zero, and total-wealth history counts from there.[/dim]')
+        if bad:
+            console.print(f'[red]⚠ {bad} unreadable line(s) in {d.cash_ledger_path()} — '
+                          f'new entries are blocked until it is fixed.[/red]')
+        if entries:
+            t = Table(box=box.ROUNDED)
+            for col, kw in [('#', dict(style='dim', justify='right')), ('Date 日期', {}),
+                            ('Type 類型', {}), ('Amount 金額', dict(justify='right')),
+                            ('Balance 餘額', dict(justify='right')), ('Note 備註', {}),
+                            ('Entered 輸入', dict(style='dim'))]:
+                t.add_column(col, **kw)
+            for e in entries[-20:]:
+                amt = e['amount']
+                colour = 'green' if amt > 0 else ('red' if amt < 0 else 'white')
+                t.add_row(str(e.get('id', '')), e['date'], d.CASH_TYPE_LABEL.get(e['type'], e['type']),
+                          f'[{colour}]{amt:+,.0f}[/{colour}]' if e['type'] != 'open' else f'{amt:,.0f}',
+                          f"{e.get('balance_after', 0):,.0f}", e.get('note', ''),
+                          str(e.get('entered_at', ''))[:16])
+            console.print(t)
+            if len(entries) > 20:
+                console.print(f'[dim]latest 20 of {len(entries)} entries[/dim]')
+        if opened:
+            console.print('\n[cyan]\\[d][/cyan] Deposit 存入  [cyan]\\[w][/cyan] Withdraw 提出  '
+                          '[cyan]\\[u][/cyan] Update balance 調整  [cyan]\\[b][/cyan] Back')
+            keys = {'d': 'deposit', 'w': 'withdraw', 'u': 'update'}
+        else:
+            console.print('\n[cyan]\\[o][/cyan] Opening balance 開帳  [cyan]\\[b][/cyan] Back')
+            keys = {'o': 'open'}
+        choice = Prompt.ask('Action', choices=list(keys) + ['b'], default='b')
+        if choice == 'b':
+            break
+        _cash_entry(d, keys[choice])
+        pause()
+
+
+def _offer_cash_after_import():
+    """Holdings and cash must move together: a sale re-imported without its
+    proceeds would read as a loss of the whole sale."""
+    d = _dashboard()
+    st = d.cash_status()
+    opened = bool(st and st.get('balance') is not None)
+    console.print('\n[dim]Holdings and cash should move together — a sale whose proceeds '
+                  'are not recorded reads as a loss of the whole sale.[/dim]')
+    if opened:
+        if Confirm.ask(f"Update your brokerage cash too? (now {st['balance']:,.0f}元)", default=True):
+            _cash_entry(d, 'update', note_default='CSV 匯入後核對券商餘額')
+    elif Confirm.ask('Start tracking your brokerage cash now? (opening balance = day zero)',
+                     default=False):
+        _cash_entry(d, 'open')
 
 
 def _menu_graphs(portfolio):
@@ -779,13 +938,15 @@ def menu_schedule():
     t.add_column('UTC',             style='yellow', justify='center')
     t.add_column('Taiwan (UTC+8)',  style='dim',    justify='center')
 
-    m_utc = sched.get('morning_utc',  '01:30')
+    m_utc = sched.get('morning_utc',  '01:05')
     c_utc = sched.get('closing_utc',  '08:00')
 
     t.add_row('Morning 開盤', m_utc, _utc_to_taiwan(m_utc))
     t.add_row('Closing 收盤', c_utc, _utc_to_taiwan(c_utc))
     console.print(t)
-    console.print('[dim]Scheduler must be restarted inside the container for changes to apply.[/dim]\n')
+    console.print('[dim]Restart the scheduler for changes to apply: '
+                  'launchctl kickstart -k gui/$(id -u)/com.panbear.financial-reporting-bot '
+                  '(not during a report slot).[/dim]\n')
 
     if Confirm.ask('Edit times?', default=False):
         new_m = Prompt.ask('Morning UTC (HH:MM)', default=m_utc)
@@ -976,6 +1137,7 @@ def menu_import_csv():
         save_json(_config_path('portfolio.json'), new_portfolio)
         console.print(f'[green]✓ Portfolio updated — {len(new_portfolio)} holdings, {new_total:,.0f}元[/green]')
         _archive_import_csv(selected)
+        _offer_cash_after_import()
 
     pause()
 
@@ -1065,7 +1227,7 @@ def menu_sandbox():
     if choice == 'b':
         return
 
-    env = {**os.environ, 'OPENCLAW_DATA_DIR': str(DATA_DIR)}
+    env = {**os.environ, 'FRB_DATA_DIR': str(DATA_DIR)}
 
     if choice == '4':
         sub = Prompt.ask('Send which? [1] Morning [2] Closing [3] All', choices=['1','2','3'], default='1')
@@ -1142,6 +1304,7 @@ def menu_ai_settings():
         t.add_row('Max tokens — 開盤展望 (outlook)',  str(ai.get('max_tokens_outlook', 200)))
         t.add_row('Max tokens — 收盤研究 (research)', str(ai.get('max_tokens_research', 350)))
         t.add_row('Max tokens — 報告總結 (summary)',  str(ai.get('max_tokens_summary', 400)))
+        t.add_row('個股原因 temperature',              str(ai.get('reason_temperature', '(model default)')))
         t.add_row('Summary model (報告總結)',          ai.get('summary_model') or '(uses Model)')
         t.add_row('Summary key env',                  ai.get('summary_key_env', 'OPENROUTER_API_KEY'))
         t.add_row('Summary temperature',              str(ai.get('summary_temperature', 0.3)))
@@ -1187,6 +1350,17 @@ def menu_ai_settings():
                     ai[key] = int(val)
                 except ValueError:
                     console.print(f'[red]Invalid number for {label}, skipped.[/red]')
+            # 個股原因 temperature — the report reads ai.reason_temperature; expose it here
+            # so it stays TUI-controlled (blank = model default).
+            rt = Prompt.ask('個股原因 temperature (blank = model default)',
+                            default=str(ai.get('reason_temperature', '') or ''))
+            if rt.strip():
+                try:
+                    ai['reason_temperature'] = float(rt)
+                except ValueError:
+                    console.print('[red]Invalid temperature, kept previous.[/red]')
+            else:
+                ai.pop('reason_temperature', None)
             save_bot_config(cfg)
             console.print('[green]✓ Token limits saved.[/green]')
             pause()
@@ -1392,14 +1566,13 @@ def menu_api_keys():
 # [8] Report Layout
 # ---------------------------------------------------------------------------
 
+# The 09:05 push since the 2026-10-02 rebuild: no watchlist, no AI sections.
 MORNING_SECTION_LABELS = [
-    ('market_overview', '市場總覽'),
-    ('global_markets',  '全球市場'),
+    ('market_overview', '加權指數（隔夜與開盤）'),
+    ('global_markets',  '全球市場（隔夜）'),
     ('holdings',        '持倉列表'),
     ('cost_line',       '  └ 損益摘要行'),
-    ('watchlist',       '觀察清單'),
-    ('ai_outlook',      'AI 開盤展望'),
-    ('report_summary',  'AI 報告總結'),
+    ('yesterday',       '昨日重點'),
 ]
 
 CLOSING_SECTION_LABELS = [
@@ -1669,6 +1842,124 @@ def _menu_global_indices(cfg):
             pause()
         else:
             break
+
+
+# ---------------------------------------------------------------------------
+# [9] Daemon Control — the Docker scheduler container that actually pushes.
+# The TUI must drive AND reflect the real running mechanism; before this panel
+# it could only edit config and fire one-shot runs, blind to the daemon.
+# ---------------------------------------------------------------------------
+
+DAEMON_CONTAINER = 'openclaw-financial-bot'
+DAEMON_AGENT_ID  = 'financial-bot'
+
+
+def _find_oc_manage():
+    """Locate the oc-manage lifecycle wrapper (env override, then known home)."""
+    candidates = []
+    env = os.getenv('OC_MANAGE', '')
+    if env:
+        candidates.append(Path(env))
+    candidates.append(Path.home() / 'Agents' / 'openclaw' / 'openclaw-infra' / 'oc-manage')
+    for p in candidates:
+        if p.is_file() and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _docker_query(*args, timeout=5):
+    """Read-only docker query. Returns stdout ('' = no match) or None when
+    docker is missing/unreachable — callers must distinguish the two."""
+    if not shutil.which('docker'):
+        return None
+    try:
+        r = subprocess.run(['docker', *args], capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _daemon_status_markup():
+    out = _docker_query('ps', '--filter', f'name=^{DAEMON_CONTAINER}$', '--format', '{{.Status}}')
+    if out is None:
+        return '[yellow]docker unavailable (Docker Desktop not running?)[/yellow]'
+    if out:
+        return f'[bold green]RUNNING[/bold green] [green]· {out} · armed schedule, pushes to Telegram[/green]'
+    return '[bold red]NOT RUNNING[/bold red] [dim]· no scheduled reports will push[/dim]'
+
+
+def _run_lifecycle(cmd, env=None):
+    """Stream a lifecycle command (deploy/build/prune/logs) to the terminal."""
+    console.print(Rule(style='dim'))
+    try:
+        subprocess.run([str(a) for a in cmd], env=env)
+    except KeyboardInterrupt:
+        console.print('\n[yellow]Stopped.[/yellow]')
+    console.print(Rule(style='dim'))
+    pause()
+
+
+def menu_daemon():
+    oc_manage = _find_oc_manage()
+    # Compose builds from ${BOT_REPO}; pin it to the repo this TUI runs from so
+    # deploy/build can never silently compile a different (stale) clone.
+    lifecycle_env = {**os.environ, 'BOT_REPO': str(SCRIPT_DIR)}
+
+    while True:
+        header('Daemon Control — Docker scheduler (the mechanism that pushes)')
+
+        image = _docker_query('images', 'openclaw-hardened:latest',
+                              '--format', '{{.Repository}}:{{.Tag}} · {{.Size}} · built {{.CreatedSince}}')
+        t = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        t.add_column(style='bold', width=10)
+        t.add_column()
+        t.add_row('container', _daemon_status_markup())
+        t.add_row('image', image if image else '[dim]openclaw-hardened:latest not built[/dim]')
+        t.add_row('manager', str(oc_manage) if oc_manage
+                  else '[yellow]oc-manage not found — lifecycle actions disabled[/yellow]')
+        t.add_row('build ctx', str(SCRIPT_DIR))
+        console.print(t)
+        console.print()
+
+        console.print('[cyan][1][/cyan] Refresh status')
+        console.print('[cyan][2][/cyan] Follow container logs (Ctrl+C to return)')
+        console.print('[cyan][3][/cyan] Resource stats (one-shot)')
+        console.print('[cyan][4][/cyan] Build image (no run)')
+        console.print('[red][5][/red] GO-LIVE deploy (armed schedule — WILL push to Telegram)')
+        console.print('[red][6][/red] Stop & remove container (halts scheduled reports)')
+        console.print('[cyan][b][/cyan] Back\n')
+
+        choice = Prompt.ask('Select', choices=['1', '2', '3', '4', '5', '6', 'b'], default='1')
+
+        if choice == 'b':
+            return
+        if choice == '1':
+            continue
+        if choice == '2':
+            console.print(f'\n[dim]docker logs -f --tail 100 {DAEMON_CONTAINER} … Ctrl+C to return[/dim]')
+            _run_lifecycle(['docker', 'logs', '-f', '--tail', '100', DAEMON_CONTAINER])
+        elif choice == '3':
+            _run_lifecycle(['docker', 'stats', '--no-stream'])
+        elif choice in ('4', '5', '6'):
+            if not oc_manage:
+                console.print('[red]oc-manage not found — cannot run lifecycle actions from here.[/red]')
+                pause(); continue
+            if choice == '4':
+                _run_lifecycle([oc_manage, 'build', DAEMON_AGENT_ID], env=lifecycle_env)
+            elif choice == '5':
+                console.print('\n[bold red]⚠ GO-LIVE: builds + starts the container with an ARMED '
+                              'schedule. Reports WILL push to real Telegram.[/bold red]')
+                if Confirm.ask('Confirm GO-LIVE deploy?', default=False):
+                    _run_lifecycle([oc_manage, 'deploy', DAEMON_AGENT_ID], env=lifecycle_env)
+                else:
+                    console.print('[dim]Cancelled.[/dim]'); pause()
+            else:
+                console.print('\n[bold red]⚠ This stops the daemon — no scheduled reports until '
+                              'the next GO-LIVE deploy.[/bold red]')
+                if Confirm.ask('Confirm stop & remove?', default=False):
+                    _run_lifecycle([oc_manage, 'prune', DAEMON_AGENT_ID], env=lifecycle_env)
+                else:
+                    console.print('[dim]Cancelled.[/dim]'); pause()
 
 
 # ---------------------------------------------------------------------------

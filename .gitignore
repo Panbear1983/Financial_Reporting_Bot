@@ -16,3 +16,21 @@ twse_daily_report.md
 portfolio.json
 Import CSV/
 data/
+*.env
+.env.*
+!.env.template
+!.env.example
+*.pem
+*.key
+auth-profiles.json
+credentials/
+tracked_stocks.json
+.DS_Store
+
+# Brokerage cash ledger and caches (personal data; data/ is already ignored —
+# named here too in case anything ever writes them at the repo root)
+cash_ledger.jsonl
+cash.json
+mis_prefix_cache.json
+official_close_cache.json
+cash_ledger_history/
