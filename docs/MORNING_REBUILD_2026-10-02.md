@@ -312,3 +312,27 @@ Where the build departed from the plan above, and what it found on the way:
   spoken, scrubbed from the AI input; four pool keys (cash, cash_as_of, cash_net_flow, total_wealth)
   on closing records only; `metrics.csv` unchanged.
 - **Verification:** `tools/verify_morning.py` — 44 checks, all passing, on a throwaway data copy.
+
+## Follow-up the same night — opening-gap arrows, and the board's streak repaired
+
+Peter's case: a holding on a long rising run that opens below yesterday's close is a signal to
+re-adjust during the session. Measured before building (Yahoo daily OHLC, his holdings):
+
+- The open's direction (vs the previous close) matched the close's direction on 77% of 1,222
+  holding-days — but only 53% when the gap was under 0.3% (a coin flip), and 81% at 0.3% or more.
+- A run of 2+ that opened against itself broke by the close 76–78% of the time; one that opened
+  with itself carried on 73–80%.
+- A 4+-day up-run that opened ≥0.3% lower broke by the close in 37 of 41 cases (90%, two years).
+
+What shipped:
+- **Live board Streak column:** a ▲ (red) / ▼ (green) after the count when today's open is ≥0.3%
+  from yesterday's close (`bot_config` `streak.open_gap_min_pct`), shown 09:00–13:30 only — at the
+  close the count itself absorbs today. Opens come from the exchange via `dashboard.opening_gaps()`
+  (Yahoo shows yesterday's open until ~09:20), asked every 30 s until every holding has opened.
+- **The board's count is now repaired** like the morning push's: `dashboard.settled_closes()` counts
+  through the last settled session (yesterday during the session, today after 13:30) on closes with
+  Yahoo's dropped sessions filled from MI_INDEX. **The 16:05 streak alert still counts on Yahoo
+  as-is** — unchanged by agreement.
+- **The morning push's ⚡ / ⚠️ verdict now also needs a ≥0.3% move**; below it the line reads
+  「→ 今日 ±x%，變動不大」 instead of calling a coin flip.
+- Checks: `tools/verify_morning.py`, 53 passing.

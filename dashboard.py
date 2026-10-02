@@ -2065,6 +2065,53 @@ def repair_daily_closes(code, closes, today, prev_close=None, lookback=30):
     return s.sort_index()
 
 
+def settled_closes(code, closes, market_open=None, now=None):
+    """Daily closes through the last SETTLED session, with Yahoo's dropped sessions
+    repaired — what the live board counts its Streak column on.
+
+    Before the open and during the session the last settled close is yesterday's;
+    after the 13:30 close on a trading day it is today's, so today joins the count
+    the moment it is final."""
+    now = now or datetime.datetime.now(ZoneInfo('Asia/Taipei'))
+    if market_open is None:
+        market_open = taiwan_market_open(now)
+    today = now.date()
+    after_close = (not market_open and is_trading_day(today)
+                   and now.time() > datetime.time(13, 30))
+    cutoff = today + datetime.timedelta(days=1) if after_close else today
+    return repair_daily_closes(code, closes, cutoff)
+
+
+def open_gap_threshold(cfg=None):
+    """The smallest opening gap (% vs yesterday's close) worth flagging.
+
+    Measured 2026-10-02 over 1,222 holding-days: an open within 0.3% of the
+    previous close called the close's direction 53% of the time — a coin flip —
+    while gaps of 0.3% or more called it 81%. A 4+-day up-run that opened 0.3%+
+    lower broke by the close 90% of the time (37 of 41, two years of data).
+    bot_config streak.open_gap_min_pct overrides the 0.3."""
+    cfg = cfg if cfg is not None else load_bot_config()
+    try:
+        v = float(((cfg or {}).get('streak') or {}).get('open_gap_min_pct', 0.3))
+    except (TypeError, ValueError):
+        v = 0.3
+    return v if v >= 0 else 0.3
+
+
+def opening_gaps(codes, now=None):
+    """{code: {'open', 'prev_close', 'gap_pct'}} for holdings that have OPENED today,
+    taken from the exchange's own feed. Yahoo still shows yesterday's open until
+    about 09:20 — exactly the minutes this is for. A holding not yet matched is
+    simply absent, and the caller asks again."""
+    today = (now or datetime.datetime.now(ZoneInfo('Asia/Taipei'))).strftime('%Y%m%d')
+    out = {}
+    for c, q in fetch_mis_quotes(codes).items():
+        op, prev = q.get('exch_open'), q.get('prev_close')
+        if q.get('session_date') == today and op and prev:
+            out[c] = {'open': op, 'prev_close': prev, 'gap_pct': (op - prev) / prev * 100}
+    return out
+
+
 def streak_marker_threshold(cfg=None):
     """How many sessions a run needs before the morning push flags it ⚡ / ⚠️.
     bot_config streak.marker_threshold, else streak_alert.threshold, else 3."""
@@ -2209,6 +2256,7 @@ def _morning_snapshot(cfg):
         'hotlist': {'top_volume': [], 'top_losers': []}, 'news': [],
         'is_stale': False, 'feed_date': '', 'prev_mismatch': [],
         'streak_threshold': streak_marker_threshold(cfg), 'flat_rule': flat_rule,
+        'open_gap_min': open_gap_threshold(cfg),
         'yesterday': last_pool_record('closing'),
     }
 

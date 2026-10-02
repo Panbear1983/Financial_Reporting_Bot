@@ -35,6 +35,7 @@ from custom_stock_lookup import get_yfinance_data
 # Data comes from the dashboard's single data layer — this module only draws.
 from dashboard import (_OHLC, _QUOTE_URL, _clean_bars, _quote_time, _suffix_cache_path,
                        close_streak, compute_positions, fetch_history, fetch_live_quotes,
+                       open_gap_threshold, opening_gaps, settled_closes,
                        fetch_quote_batch, resolve_any, resolve_symbols,
                        taiwan_market_open)
 
@@ -65,6 +66,7 @@ QUOTE_TTL_CLOSED = 600
 # hour late (see close_streak).
 DAILY_TTL        = 3600
 DAILY_RETRY      = 60    # min gap between daily-fetch attempts (Yahoo throttles)
+OPEN_GAP_RETRY   = 30    # ask the exchange for today's opens this often until all have opened
 
 
 # ---------------------------------------------------------------------------
@@ -216,21 +218,33 @@ def _fmt_signed(v, pct=False):
     return f'[{color}]{s}[/{color}]'
 
 
-def _fmt_streak(streaks, code):
+def _gap_arrow(gap, threshold):
+    """▲ / ▼ for today's opening gap vs yesterday's close — only when it is big
+    enough to mean something (see open_gap_threshold). TW colours: red up."""
+    if gap is None or abs(gap) < threshold:
+        return ''
+    return ' [red]▲[/red]' if gap > 0 else ' [green]▼[/green]'
+
+
+def _fmt_streak(streaks, code, gap=None, threshold=0.3):
     """(Streak cell, Run% cell). streaks=None → daily bars not fetched yet;
-    a code missing from a fetched dict → no daily bars for it."""
+    a code missing from a fetched dict → no daily bars for it. gap is today's
+    opening gap in %, given only while the session is open; the arrow beside the
+    settled count is Peter's early warning that a run may be breaking."""
+    arrow = _gap_arrow(gap, threshold)
     if streaks is None:
-        return '[dim]…[/dim]', ''
+        return '[dim]…[/dim]' + arrow, ''
     sk = streaks.get(code)
     if sk is None:
-        return '[dim]—[/dim]', ''
+        return '[dim]—[/dim]' + arrow, ''
     if sk['run'] == 0:
-        return '[dim]0[/dim]', '[dim]0.00%[/dim]'
+        return '[dim]0[/dim]' + arrow, '[dim]0.00%[/dim]'
     color = 'red' if sk['run'] > 0 else 'green'      # TW convention, as above
-    return f"[{color}]{sk['run']:+d}[/{color}]", _fmt_signed(sk['pct'], pct=True)
+    return f"[{color}]{sk['run']:+d}[/{color}]" + arrow, _fmt_signed(sk['pct'], pct=True)
 
 
-def build_live_table(portfolio, quotes, market_open=None, streaks=None):
+def build_live_table(portfolio, quotes, market_open=None, streaks=None,
+                     open_gaps=None, gap_threshold=0.3):
     """Rich rendering of compute_positions() for the live board.
 
     streaks: {code: close_streak()} for the Streak / Run% columns, or None
@@ -261,7 +275,8 @@ def build_live_table(portfolio, quotes, market_open=None, streaks=None):
         t.add_column(col, **kw)
 
     for i, r in enumerate(calc['rows'], 1):
-        streak, run_pct = _fmt_streak(streaks, r['code'])
+        gap = (open_gaps or {}).get(r['code'], {}).get('gap_pct')
+        streak, run_pct = _fmt_streak(streaks, r['code'], gap, gap_threshold)
         if r['price'] is None:
             t.add_row(str(i), r['code'], r['name'], f"{r['shares']:,}",
                       '[dim]…[/dim]', '', '', '', '', '', streak, run_pct)
@@ -367,7 +382,9 @@ class _Worker(threading.Thread):
         self.range_key = '1'                 # currently displayed range
         self.state = {'quotes': {}, 'quotes_at': None, 'quotes_try_at': None,
                       'hist': {}, 'compare': None, 'error': '', 'backoff': 1,
-                      'daily': None, 'daily_try_at': None, 'streaks': None}
+                      'daily': None, 'daily_try_at': None, 'streaks': None,
+                      'open_gaps': None, 'open_gaps_try_at': None,
+                      'gap_threshold': open_gap_threshold()}
 
     def set_range(self, key):
         with self.lock:
@@ -440,10 +457,30 @@ class _Worker(threading.Thread):
                 for code, sym in self.symbol_map.items():
                     sub = bars.get(sym)
                     if sub is not None and 'Close' in sub.columns:
-                        streaks[code] = close_streak(sub['Close'], mkt_open)
+                        # Yahoo drops whole sessions for ETFs (measured 2026-10-02);
+                        # count on closes repaired from the exchange, through the
+                        # last settled session.
+                        streaks[code] = close_streak(
+                            settled_closes(code, sub['Close'], mkt_open), market_open=False)
                 with self.lock:
                     self.state['daily'] = {'at': datetime.datetime.now(), 'open': mkt_open}
                     self.state['streaks'] = streaks
+
+        # Today's opening gaps, from the exchange (Yahoo shows yesterday's open
+        # until ~09:20). Asked while the session is open until every holding has
+        # opened, then left alone — an open never changes. The board shows them
+        # only until the 13:30 close, when the count itself absorbs today.
+        if mkt_open:
+            day = datetime.datetime.now(ZoneInfo('Asia/Taipei')).date().isoformat()
+            og = st.get('open_gaps') or {}
+            gaps = og.get('gaps', {}) if og.get('day') == day else {}
+            if (len(gaps) < len(self.portfolio)
+                    and self._stale(st.get('open_gaps_try_at'), OPEN_GAP_RETRY * backoff)):
+                with self.lock:
+                    self.state['open_gaps_try_at'] = datetime.datetime.now()
+                got = opening_gaps(list(self.portfolio))
+                with self.lock:
+                    self.state['open_gaps'] = {'day': day, 'gaps': {**gaps, **got}}
 
         _, period, interval, ttl = RANGES[rkey]
         entry = st['hist'].get(rkey)
@@ -567,8 +604,13 @@ def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
     ykeys = f'\\[l] log \\[%] %ret [dim]({_YMODE_TAG[y_mode]})[/dim]'
 
     if page == 0:
+        og = st.get('open_gaps') or {}
+        today = datetime.datetime.now(ZoneInfo('Asia/Taipei')).date().isoformat()
+        gaps = og.get('gaps') if taiwan_market_open() and og.get('day') == today else None
         table, n_unpriced, frozen = build_live_table(portfolio, st['quotes'],
-                                                     streaks=st.get('streaks'))
+                                                     streaks=st.get('streaks'),
+                                                     open_gaps=gaps,
+                                                     gap_threshold=st.get('gap_threshold', 0.3))
         notes = []
         # Only after a fetch has actually landed — before that every holding is
         # "unpriced" simply because the first cycle hasn't returned yet, and the
@@ -591,8 +633,11 @@ def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
                                        w, chart_h, hline=total_cost, y_mode=y_mode)
                      if entry is not None else Text('fetching…', style='dim'))
         parts.insert(1, table)
-        parts.insert(2, Text('Streak = straight closed sessions up (+) / down (−) · '
-                             'Run% = total move since that run began', style='dim'))
+        legend = ('Streak = straight closed sessions up (+) / down (−) · '
+                  'Run% = total move since that run began')
+        if gaps:
+            legend += " · ▲▼ = today's open vs yesterday's close"
+        parts.insert(2, Text(legend, style='dim'))
         for note in notes:
             parts.append(Text(note, style='yellow'))
         keybar = f'[dim]\\[1-7] range  \\[n/p ←/→] page  {ykeys}  \\[q] back[/dim]'

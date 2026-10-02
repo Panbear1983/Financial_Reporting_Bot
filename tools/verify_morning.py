@@ -115,10 +115,31 @@ check('a 3+ up-run extending today is ⚡ with 賣出觀察',
 check('a 3+ down-run breaking today is ⚠️ with 止跌觀察',
       t._morning_run_lines(holding(-4, 11, 10), 3)[0] == '⚠️'
       and '止跌觀察' in t._morning_run_lines(holding(-4, 11, 10), 3)[1])
+check('a 3+ run moving under 0.3% today gets no verdict (coin flip)',
+      t._morning_run_lines(holding(5, 10.02, 10), 3, 0.3)[0] == '•'
+      and '變動不大' in t._morning_run_lines(holding(5, 10.02, 10), 3, 0.3)[1])
 check('a run under the threshold gets no marker',
       t._morning_run_lines(holding(2, 11, 10), 3)[0] == '•')
 check("today's move is never folded into the count",
       '連漲 5 日' in t._morning_run_lines(holding(5, 11, 10), 3)[1])
+
+# 5b. The live board's streak: repaired closes through the last SETTLED session,
+#     and the opening-gap arrow only when the gap means something.
+import live_portfolio as lp
+tz = d.ZoneInfo('Asia/Taipei')
+wk = pd.Series([1.0, 2.0, 3.0], index=pd.to_datetime(['2026-09-30', '2026-10-01', '2026-10-02']))
+d._official_close = lambda day, code: None
+during = d.settled_closes('x', wk, market_open=True, now=datetime.datetime(2026, 10, 2, 10, 0, tzinfo=tz))
+after = d.settled_closes('x', wk, market_open=False, now=datetime.datetime(2026, 10, 2, 15, 0, tzinfo=tz))
+before = d.settled_closes('x', wk, market_open=False, now=datetime.datetime(2026, 10, 2, 8, 0, tzinfo=tz))
+d._official_close = _orig_close
+check('during the session the board counts through yesterday', during.index[-1].date() == datetime.date(2026, 10, 1))
+check('after the 13:30 close today joins the count', after.index[-1].date() == datetime.date(2026, 10, 2))
+check('before the open the board counts through yesterday', before.index[-1].date() == datetime.date(2026, 10, 1))
+check('a 0.5% lower open shows a green ▼', lp._gap_arrow(-0.5, 0.3) == ' [green]▼[/green]')
+check('a 0.5% higher open shows a red ▲', lp._gap_arrow(0.5, 0.3) == ' [red]▲[/red]')
+check('a 0.1% gap shows no arrow', lp._gap_arrow(0.1, 0.3) == '' and lp._gap_arrow(None, 0.3) == '')
+check('the default gap threshold is 0.3%', d.open_gap_threshold({}) == 0.3)
 
 # 6. Cash: with no ledger the totals keep their exact old shape.
 pf = {'0050': {'shares': 1000, 'cost_basis': 100000, 'name': 'x'}}

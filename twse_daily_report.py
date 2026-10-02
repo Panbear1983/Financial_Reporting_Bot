@@ -564,7 +564,7 @@ def ai_closing_commentary(taiex_pct, global_lines, top_vol, top_losers,
 # 16:00 push already delivered them from final data.
 # ---------------------------------------------------------------------------
 
-def _morning_run_lines(h, threshold):
+def _morning_run_lines(h, threshold, move_min=0.0):
     """(mark, second line) for one holding: the settled streak, then whether
     today so far is extending or breaking it.
 
@@ -585,6 +585,10 @@ def _morning_run_lines(h, threshold):
     move = h['price'] - h['prev_cls'] if h.get('prev_cls') else 0.0
     if move == 0:
         return '•', text + "　→ 今日平盤"
+    if abs(h['pct']) < move_min:
+        # Under the threshold the early direction is a coin flip (measured 53%),
+        # so it gets no verdict — see dashboard.open_gap_threshold.
+        return '•', text + f"　→ 今日 {h['pct']:+.2f}%，變動不大"
     if (move > 0) == up:
         tail = f"　→ 今日 {h['pct']:+.2f}%，{'連漲' if up else '連跌'}延續第 {abs(run) + 1} 天"
         return '⚡', text + tail + (" → 賣出觀察" if up else "")
@@ -671,7 +675,7 @@ def generate_morning_report():
         hold.extend(_cash_lines(total))
     hold.append("")
     for h in snap['holdings']:
-        mark, run_line = _morning_run_lines(h, threshold)
+        mark, run_line = _morning_run_lines(h, threshold, snap.get('open_gap_min', 0.0))
         op = f"{h['open_p']:,.2f}" if h.get('open_p') is not None else '—'
         late = '（延遲）' if h.get('src') != 'mis' else ''
         dp = h.get('daily_pnl')
