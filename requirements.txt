@@ -8,3 +8,4 @@ plotext>=5.2.8
 schedule>=1.2.0
 certifi>=2024.0.0
 edge-tts
+matplotlib>=3.8          # month-end total-wealth picture (monthly_wealth.py)

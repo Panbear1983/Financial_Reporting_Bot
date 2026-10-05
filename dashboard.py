@@ -2146,6 +2146,96 @@ def last_pool_record(mode='closing'):
     return last
 
 
+# ---------------------------------------------------------------------------
+# Total-wealth history — what the month-end push graphs
+#
+# Peter, 2026-10-05: "the cash sitting in a reserve should also be part of the
+# entire portfolio ... but that should not be taking into the stock gain, but
+# merely just adding a piece of information." So this is a SECOND ledger that
+# never mixes with the first: the daily closing snapshots already record stocks,
+# cash and their sum, and this just reads them back. Cash never enters a
+# performance number here either — the only "growth" shown is total wealth minus
+# the money he put in himself (net_flow), which is the one honest version.
+# ---------------------------------------------------------------------------
+
+WEALTH_MONTHLY_FILE = 'wealth_monthly.csv'      # diary/, local only (data/ is gitignored)
+_WEALTH_COLS = ('month', 'date', 'stocks', 'cost', 'cash', 'total_wealth', 'net_flow', 'cash_as_of')
+
+
+def wealth_history():
+    """Daily closing snapshots, oldest -> newest, one row per date.
+
+    Each row: date, stocks (market value), cost (stock cost basis), and — only
+    from 2026-10-05, when cash was first recorded — cash, total_wealth, net_flow
+    (deposits - withdrawals: money Peter put in himself) and cash_as_of. Earlier
+    rows carry None for those four. The graph draws the stock line back through
+    them and starts the total-wealth line where it truly begins; it must never
+    backfill a cash balance that was not recorded at the time.
+    """
+    by_date = {}
+    try:
+        with open(os.path.join(DATA_DIR, 'diary', 'pool.jsonl'), encoding='utf-8') as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if (not isinstance(rec, dict) or rec.get('mode') != 'closing'
+                        or not rec.get('date') or rec.get('pf_value_total') is None):
+                    continue
+                tw = rec.get('total_wealth')
+                by_date[rec['date']] = {             # the latest closing run of a date wins
+                    'date': rec['date'],
+                    'stocks': float(rec['pf_value_total']),
+                    'cost': float(rec.get('pf_cost_total') or 0.0),
+                    'cash': None if rec.get('cash') is None else float(rec['cash']),
+                    'total_wealth': None if tw is None else float(tw),
+                    'net_flow': (None if rec.get('cash_net_flow') is None
+                                 else float(rec['cash_net_flow'])),
+                    'cash_as_of': rec.get('cash_as_of'),
+                }
+    except OSError:
+        return []
+    return [by_date[k] for k in sorted(by_date)]
+
+
+def month_end_rows(history=None):
+    """One row per calendar month: the LAST closing snapshot that month, oldest
+    -> newest, each tagged with 'month' (YYYY-MM). On a month whose last calendar
+    day is a weekend or holiday that is simply the last trading day's close —
+    which is the right month-end figure, and the push labels the real date."""
+    rows = wealth_history() if history is None else history
+    by_month = {}
+    for r in rows:
+        by_month[r['date'][:7]] = r                  # sorted input: last date wins
+    return [dict(month=m, **by_month[m]) for m in sorted(by_month)]
+
+
+def record_month_end(row):
+    """Write/replace one month's row in diary/wealth_monthly.csv. Insurance for the
+    long-term graph: a month-end roll-up that survives any pruning of the daily
+    records. Atomic (temp + os.replace), like every other write in this file."""
+    path = os.path.join(DATA_DIR, 'diary', WEALTH_MONTHLY_FILE)
+    existing = {}
+    try:
+        with open(path, encoding='utf-8', newline='') as f:
+            for rec in csv.DictReader(f):
+                if rec.get('month'):
+                    existing[rec['month']] = rec
+    except OSError:
+        pass
+    existing[row['month']] = {c: ('' if row.get(c) is None else row.get(c)) for c in _WEALTH_COLS}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=list(_WEALTH_COLS))
+        w.writeheader()
+        for m in sorted(existing):
+            w.writerow(existing[m])
+    os.replace(tmp, path)
+    return path
+
+
 def _morning_snapshot(cfg):
     """Everything the 09:05 push prints. Holdings only — the morning push carries
     no watchlist — and no RSI / 量比 / 融資 / PE: those are all yesterday's at

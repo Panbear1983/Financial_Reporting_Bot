@@ -10,6 +10,7 @@ Data source rules — ZERO figure hallucination:
 """
 
 import urllib.request
+import io
 import json
 import csv
 import os
@@ -155,6 +156,17 @@ def _render_sandbox(text):
 # Telegram
 # ---------------------------------------------------------------------------
 
+def _render_sandbox_photo(png):
+    """Sandbox twin of _render_sandbox for a picture: write it next to the text
+    preview and print the path, so a dry run shows exactly what Telegram would."""
+    data_dir = os.getenv('FRB_DATA_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
+    os.makedirs(data_dir, exist_ok=True)
+    fpath = os.path.join(data_dir, f"sandbox_photo_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+    with open(fpath, 'wb') as f:
+        f.write(png)
+    print(f"  [SANDBOX] Picture saved to:\n  {fpath}\n", flush=True)
+
+
 def send_telegram_report(text):
     if os.getenv('SANDBOX_MODE', '').lower() == 'true':
         _render_sandbox(text)
@@ -226,7 +238,36 @@ def _send_telegram(token, chat_id, text):
     return ok_all
 
 
-def deliver_report(text, cfg=None):
+def _send_telegram_photo(token, chat_id, png, caption=None):
+    """POST one PNG to one Telegram destination (sendPhoto). Returns bool; never
+    raises. Same shape as report_voice.send — a multipart upload with the file in
+    `files` — and the caption is clipped at Telegram's 1024-char limit."""
+    if not (token and chat_id and png):
+        return False
+    payload = {'chat_id': str(chat_id)}
+    if caption:
+        payload['caption'] = caption[:1024]
+    for attempt, delay in ((1, 2), (2, 5), (3, 0)):
+        try:
+            resp = requests.post(
+                f'https://api.telegram.org/bot{token}/sendPhoto',
+                data=payload,
+                files={'photo': ('wealth.png', io.BytesIO(png), 'image/png')},
+                timeout=120)
+            if resp.ok:
+                print(f"[{_now()}] Photo sent → {chat_id}.")
+                return True
+            print(f"[{_now()}] Photo failed ({chat_id}, attempt {attempt}): {resp.text[:200]}")
+            if resp.status_code < 500:
+                return False
+        except Exception as e:                                             # noqa: BLE001
+            print(f"[{_now()}] Photo error ({chat_id}, attempt {attempt}): {e}")
+        if delay:
+            time.sleep(delay)
+    return False
+
+
+def deliver_report(text, cfg=None, photo=None, photo_caption=None):
     """Deliver the report to every enabled channel in cfg['delivery']['channels'].
 
     Backward compatible: when no channels are configured, falls back to the single
@@ -237,6 +278,8 @@ def deliver_report(text, cfg=None):
     and skipped (never silently faked as delivered)."""
     if os.getenv('SANDBOX_MODE', '').lower() == 'true':
         _render_sandbox(text)
+        if photo:
+            _render_sandbox_photo(photo)
         return
     if cfg is None:
         cfg = load_bot_config()
@@ -246,6 +289,8 @@ def deliver_report(text, cfg=None):
     if not channels:
         token, chat_id = os.getenv('TELEGRAM_BOT_TOKEN'), os.getenv('TELEGRAM_CHAT_ID')
         _send_telegram(token, chat_id, text)
+        if photo:
+            _send_telegram_photo(token, chat_id, photo, photo_caption)
         voice_targets.append((token, chat_id))
     else:
         for ch in channels:
@@ -255,6 +300,8 @@ def deliver_report(text, cfg=None):
                 token   = os.getenv(ch.get('token_env', 'TELEGRAM_BOT_TOKEN')) or os.getenv('TELEGRAM_BOT_TOKEN')
                 chat_id = ch.get('chat_id') or os.getenv('TELEGRAM_CHAT_ID')
                 _send_telegram(token, chat_id, text)
+                if photo:
+                    _send_telegram_photo(token, chat_id, photo, photo_caption)
                 if ch.get('voice', True):
                     voice_targets.append((token, chat_id))
             else:

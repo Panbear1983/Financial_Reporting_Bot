@@ -76,6 +76,11 @@ def for_speech(text):
         # The 09:05 push is short (~1,200 characters, no AI) and Peter asked for
         # all of it to be read (2026-10-02). The closing push keeps the slice.
         return text
+    if '月結總資產' in (lines[0] if lines else ''):
+        # The month-end wealth push is a handful of lines that go WITH a picture
+        # the listener cannot hear — so every line is read (Peter, 2026-10-05:
+        # "back it up with text and voice message").
+        return text
     out = []
 
     for i, l in enumerate(lines):
