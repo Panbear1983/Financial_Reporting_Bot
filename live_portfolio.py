@@ -167,11 +167,21 @@ def candle_renderable(ohlc_df, title, width, height, hline=None, y_mode='linear'
         dates = [ts.strftime(fmt) for ts in idx]
     if y_mode == 'pct':
         base = float(ohlc_df['Close'].iloc[0]) or 1.0
-        plt.plot(dates, [(v / base - 1.0) * 100 for v in ohlc_df['Close'].tolist()])
+        pcts = [(v / base - 1.0) * 100 for v in ohlc_df['Close'].tolist()]
+        # A single series can't be coloured bar-by-bar, so colour it by where it
+        # ends up over the window — TW convention again, red for a net gain.
+        plt.plot(dates, pcts, color=('red' if pcts[-1] > 0 else
+                                     'green' if pcts[-1] < 0 else 'white'))
         plt.hline(0, 'gray')
         plt.title(f'{title}  (% from start)')
     else:
-        plt.candlestick(dates, {c: ohlc_df[c].tolist() for c in _OHLC})
+        # TW convention: red = up, green = down. plotext's own default is the
+        # Western pair ['green', 'red'] (colors[0] is used when close > open),
+        # which reads as the exact OPPOSITE of the holdings table sitting
+        # directly above this chart. Pass the pair explicitly — never rely on
+        # the library default here.
+        plt.candlestick(dates, {c: ohlc_df[c].tolist() for c in _OHLC},
+                        colors=['red', 'green'])
         # Zoom Y to the actual price band (+ margin) so real fluctuation is
         # visible. Otherwise a break-even line far below the data (or just a
         # large absolute base) stretches the axis and flattens the candles into

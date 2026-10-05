@@ -712,7 +712,11 @@ def menu_cash():
                 t.add_column(col, **kw)
             for e in entries[-20:]:
                 amt = e['amount']
-                colour = 'green' if amt > 0 else ('red' if amt < 0 else 'white')
+                # TW convention, same as every other figure on these screens:
+                # red = money in, green = money out. Western ledgers do the
+                # reverse; one rule across the whole dashboard beats matching
+                # accounting habit on a single page.
+                colour = 'red' if amt > 0 else ('green' if amt < 0 else 'white')
                 t.add_row(str(e.get('id', '')), e['date'], d.CASH_TYPE_LABEL.get(e['type'], e['type']),
                           f'[{colour}]{amt:+,.0f}[/{colour}]' if e['type'] != 'open' else f'{amt:,.0f}',
                           f"{e.get('balance_after', 0):,.0f}", e.get('note', ''),
