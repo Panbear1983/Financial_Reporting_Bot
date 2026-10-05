@@ -23,6 +23,8 @@ last trading day's close, and the header says which day that was.
     python monthly_wealth.py --month=2026-10 # a specific month
     python monthly_wealth.py --dry-run       # build + print, send nothing
     SANDBOX_MODE=true python monthly_wealth.py   # full delivery dry run (preview files)
+    python monthly_wealth.py --to=<chat_id>      # a TEST send to one chat: ignores the
+                                                 # enabled switch, archives nothing
 """
 import io
 import os
@@ -252,15 +254,18 @@ def already_sent(month):
     return os.path.exists(archive_paths(month)[0])
 
 
-def run(month=None, send=True, force=False):
+def run(month=None, send=True, force=False, to=None):
+    """`to` = a Telegram chat id for a TEST send: it overrides the destination,
+    ignores the enabled switch (a human typed it), and writes no archive — so a
+    test can never make the real month-end look already sent."""
     cfg = dashboard.load_bot_config()
     mcfg = cfg.get('monthly') or {}
-    if not mcfg.get('enabled', True):
+    if not mcfg.get('enabled', True) and not to:
         print(f"[{_now()}] Monthly wealth push disabled in bot_config.")
         return None
     today = taipei_today()
     month = month or today.strftime('%Y-%m')
-    if send and already_sent(month) and not force:
+    if send and already_sent(month) and not force and not to:
         print(f"[{_now()}] Month-end push for {month} already sent — skipping (use --force to resend).")
         return None
 
@@ -287,9 +292,13 @@ def run(month=None, send=True, force=False):
             print(f"[{_now()}] Preview picture → {out}")
         return text
 
+    if to:
+        os.environ['TELEGRAM_CHAT_ID'] = str(to)      # deliver_report reads it at send time
+        cfg = dict(cfg, delivery=None)                 # and never the configured channels
+        print(f"[{_now()}] TEST send → chat {to} (no archive, schedule untouched)")
     tdr.deliver_report(text, cfg, photo=png, photo_caption=f"{s['month']} 總資產走勢")
 
-    if os.getenv('SANDBOX_MODE', '').lower() != 'true':
+    if os.getenv('SANDBOX_MODE', '').lower() != 'true' and not to:
         md, pngpath = archive_paths(month)
         os.makedirs(os.path.dirname(md), exist_ok=True)
         with open(md, 'w', encoding='utf-8') as f:
@@ -307,4 +316,5 @@ def run(month=None, send=True, force=False):
 if __name__ == '__main__':
     args = sys.argv[1:]
     month = next((a.split('=', 1)[1] for a in args if a.startswith('--month=')), None)
-    run(month=month, send='--dry-run' not in args, force='--force' in args)
+    to    = next((a.split('=', 1)[1] for a in args if a.startswith('--to=')), None)
+    run(month=month, send='--dry-run' not in args, force='--force' in args, to=to)
