@@ -140,6 +140,9 @@ check('a 0.5% lower open shows a green ▼', lp._gap_arrow(-0.5, 0.3) == ' [gree
 check('a 0.5% higher open shows a red ▲', lp._gap_arrow(0.5, 0.3) == ' [red]▲[/red]')
 check('a 0.1% gap shows no arrow', lp._gap_arrow(0.1, 0.3) == '' and lp._gap_arrow(None, 0.3) == '')
 check('the default gap threshold is 0.3%', d.open_gap_threshold({}) == 0.3)
+check('an up market wears the RED circle', t.get_market_sentiment(1.5).startswith('🔴'))
+check('a down market wears the GREEN circle', t.get_market_sentiment(-1.5).startswith('🟢'))
+check('a flat market stays neutral yellow', t.get_market_sentiment(0.2).startswith('🟡'))
 
 # 6. Cash: with no ledger the totals keep their exact old shape.
 pf = {'0050': {'shares': 1000, 'cost_basis': 100000, 'name': 'x'}}

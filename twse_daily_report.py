@@ -278,9 +278,9 @@ def deliver_report(text, cfg=None):
 
 def get_market_sentiment(pct):
     if pct > 1:
-        return '🟢 樂觀'
+        return '🔴 樂觀'
     elif pct < -1:
-        return '🔴 謹慎'
+        return '🟢 謹慎'
     return '🟡 觀望'
 
 
