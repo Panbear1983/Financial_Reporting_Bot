@@ -247,9 +247,10 @@ def _draw_lines(ax, history, s, months_back, font):
     ax.set_title('每日走勢', fontproperties=font, fontsize=11, loc='left')
 
 
-def build_png(history, s, months_back=12, month_end=True, layout='bars+line'):
-    """The picture as PNG bytes. layout: 'bars+line' (month-end bars over the
-    daily path) or 'bars' (bars only)."""
+def build_png(history, s, months_back=12, month_end=True, layout='bars'):
+    """The picture as PNG bytes. layout: 'bars' (Peter's pick, 2026-10-05: "the bar
+    graph looks good keep that one and ditch the line graph") or 'bars+line'
+    (the daily path in a smaller panel underneath)."""
     import matplotlib
     matplotlib.use('Agg')                              # headless — this runs under launchd
     import matplotlib.pyplot as plt
@@ -322,7 +323,7 @@ def run(month=None, send=True, force=False, to=None):
     png = None
     try:
         png = build_png(history, s, months_back=int(mcfg.get('months_back', 12)), month_end=month_end,
-                        layout=mcfg.get('layout', 'bars+line'))
+                        layout=mcfg.get('layout', 'bars'))
     except Exception as exc:                                         # noqa: BLE001
         print(f"[{_now()}] Picture skipped: {type(exc).__name__}: {exc}")
         text += "\n⚠️ 本月圖表產生失敗，僅附文字"
