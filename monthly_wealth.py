@@ -165,74 +165,115 @@ def build_text(s, month_end=True):
     return '\n'.join(lines)
 
 
-def build_png(history, s, months_back=12, month_end=True):
-    """The picture: total wealth, stock value, and the money put in, as PNG bytes."""
+def _draw_bars(ax, history, s, months_back, font, month_end):
+    """Month-to-month comparison, Peter's ask (2026-10-05): one bar per month-end.
+
+    Stacked: stocks (blue) with cash (grey) on top, so the bar's height IS total
+    wealth — and months before cash was recorded are stocks-only bars, which is
+    exactly what was known then. Under each month: the change in STOCK value vs
+    the previous month (always comparable), and the change in total wealth only
+    when both months carry it. Oct-vs-Sep is never shown as "+887k" when 486k of
+    that is cash being written down for the first time."""
+    rows = [r for r in dashboard.month_end_rows(history) if r['month'] <= s['month']][-months_back:]
+    if not rows:
+        return
+    x = list(range(len(rows)))
+    stocks = [r['stocks'] for r in rows]
+    cash = [r['cash'] or 0.0 for r in rows]
+    ax.bar(x, stocks, color='#1f4e9c', width=0.62, label='股票市值')
+    ax.bar(x, cash, bottom=stocks, color='#95a5a6', width=0.62, label='現金（自 2026-10 起記錄）')
+    top = max(st + c for st, c in zip(stocks, cash))
+    ax.set_ylim(0, top * 1.22)
+    for i, r in enumerate(rows):
+        total = r['stocks'] + (r['cash'] or 0.0)
+        label = f"{total:,.0f}" if r['cash'] is not None else f"{r['stocks']:,.0f}\n（僅股票）"
+        ax.text(i, total + top * 0.015, label, ha='center', va='bottom', fontproperties=font,
+                fontsize=10, color='#222')
+        if i > 0:
+            prev = rows[i - 1]
+            ds = r['stocks'] - prev['stocks']
+            pct = (ds / prev['stocks'] * 100) if prev['stocks'] else 0.0
+            note = f"股票 {ds:+,.0f}（{pct:+.1f}%）"
+            if r['cash'] is not None and prev['cash'] is not None:
+                dt = total - (prev['stocks'] + prev['cash'])
+                note += f"\n總資產 {dt:+,.0f}"
+            colour = '#c0392b' if ds > 0 else ('#27ae60' if ds < 0 else '#555')   # TW: red up
+            ax.text(i, -top * 0.035, note, ha='center', va='top', fontproperties=font,
+                    fontsize=9, color=colour)
+    labels = []
+    for r in rows:
+        lab = r['month']
+        if r['month'] == s['month'] and not month_end:
+            lab += f"\n(至 {s['date'][5:]})"
+        labels.append(lab)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontproperties=font, fontsize=10)
+    ax.tick_params(axis='x', pad=34)                 # room for the change notes
+    ax.set_title('月底總資產比較', fontproperties=font, fontsize=13, loc='left')
+    ax.legend(prop=font, loc='upper left', frameon=False, fontsize=9)
+    ax.grid(True, axis='y', color='#e6e6e6', linewidth=0.8)
+    ax.set_axisbelow(True)
+
+
+def _draw_lines(ax, history, s, months_back, font):
+    """The daily path behind the bars: stock value back to July, total wealth
+    from 2026-10-05 (dots while there are few points), and 投入成本."""
+    import matplotlib.dates as mdates
+    cutoff = (datetime.date.fromisoformat(s['date']).replace(day=1)
+              - datetime.timedelta(days=31 * (months_back - 1))).replace(day=1)
+    rows = [r for r in history if cutoff.isoformat() <= r['date'] <= s['date']]
+    dates = [datetime.date.fromisoformat(r['date']) for r in rows]
+    stocks = [r['stocks'] for r in rows]
+    wealth = [r['total_wealth'] for r in rows]
+    ax.plot(dates, stocks, color='#1f4e9c', linewidth=1.8, label='股票市值（每日）')
+    wd = [d for d, v in zip(dates, wealth) if v is not None]
+    wv = [v for v in wealth if v is not None]
+    if wv:
+        few = len(wv) <= 5
+        ax.plot(wd, wv, color='#c0392b', linewidth=2.2, label='總資產（每日）',
+                marker='o' if few else None, markersize=5)
+    first = next((r for r in rows if r['cash'] is not None), None)
+    if first:
+        base = first['cash'] - (first['net_flow'] or 0.0)
+        pd_ = [d for d, r in zip(dates, rows) if r['cash'] is not None]
+        pv = [r['cost'] + base + (r['net_flow'] or 0.0) for r in rows if r['cash'] is not None]
+        ax.step(pd_, pv, where='post', color='#7f8c8d', linewidth=1.2, linestyle='--',
+                label='投入成本（持股成本＋開帳現金＋存入－提出）',
+                marker='s' if len(pv) <= 5 else None, markersize=4)
+    ax.xaxis.set_major_locator(mdates.MonthLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+    ax.grid(True, color='#e6e6e6', linewidth=0.8)
+    ax.legend(prop=font, loc='upper left', frameon=False, fontsize=8)
+    ax.set_title('每日走勢', fontproperties=font, fontsize=11, loc='left')
+
+
+def build_png(history, s, months_back=12, month_end=True, layout='bars+line'):
+    """The picture as PNG bytes. layout: 'bars+line' (month-end bars over the
+    daily path) or 'bars' (bars only)."""
     import matplotlib
     matplotlib.use('Agg')                              # headless — this runs under launchd
     import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
     from matplotlib import font_manager as fm
     from matplotlib.ticker import FuncFormatter
 
     font = fm.FontProperties(fname=cjk_font_path()) if cjk_font_path() else fm.FontProperties()
-
-    cutoff = (datetime.date.fromisoformat(s['date']).replace(day=1)
-              - datetime.timedelta(days=31 * (months_back - 1))).replace(day=1)
-    rows = [r for r in history if r['date'] >= cutoff.isoformat() and r['date'] <= s['date']]
-    dates = [datetime.date.fromisoformat(r['date']) for r in rows]
-    stocks = [r['stocks'] for r in rows]
-    wealth = [r['total_wealth'] for r in rows]                      # None before 2026-10-05
-    # 投入成本: what the holdings cost + the cash that came from outside (the
-    # opening balance plus deposits − withdrawals). Drawn only where cash was
-    # recorded. It is deliberately NOT called "money deposited": the stock cost
-    # basis is what he paid for what he holds today, which may itself include
-    # reinvested past profits — the ledger cannot see that far back, and the
-    # label says exactly what the line is instead of claiming more.
-    first = next((r for r in rows if r['cash'] is not None), None)
-    base = (first['cash'] - (first['net_flow'] or 0.0)) if first else None   # opening balance
-    put_in = [(r['cost'] + base + (r['net_flow'] or 0.0))
-              if (base is not None and r['cash'] is not None) else None for r in rows]
-
-    fig, ax = plt.subplots(figsize=(12, 6.5), dpi=110)
-    ax.plot(dates, stocks, color='#1f4e9c', linewidth=2, label='股票市值')
-    if any(v is not None for v in wealth):
-        wd = [d for d, v in zip(dates, wealth) if v is not None]
-        wv = [v for v in wealth if v is not None]
-        # The first months have only a handful of total-wealth points (it was
-        # first recorded on 2026-10-05): draw them as dots, or a one-point "line"
-        # is invisible and the legend promises a line that is not there.
-        few = len(wv) <= 5
-        ax.plot(wd, wv, color='#c0392b', linewidth=2.6, label='總資產（股票＋現金）',
-                marker='o' if few else None, markersize=6)
-        pd_ = [d for d, v in zip(dates, put_in) if v is not None]
-        pv = [v for v in put_in if v is not None]
-        if pv:
-            ax.step(pd_, pv, where='post', color='#7f8c8d', linewidth=1.4,
-                    linestyle='--', label='投入成本（持股成本＋開帳現金＋存入－提出）',
-                    marker='s' if few else None, markersize=5)
-            ax.annotate(f"{pv[-1]:,.0f}", (pd_[-1], pv[-1]), textcoords='offset points',
-                        xytext=(6, -4), fontproperties=font, fontsize=9, color='#7f8c8d')
-        ax.annotate(f"{wv[-1]:,.0f}", (wd[-1], wv[-1]), textcoords='offset points',
-                    xytext=(6, 6), fontproperties=font, fontsize=10, color='#c0392b')
-        if s['wealth_since'] and dates and dates[0] < datetime.date.fromisoformat(s['wealth_since']):
-            ax.axvline(datetime.date.fromisoformat(s['wealth_since']), color='#999', linewidth=0.8,
-                       linestyle=':')
-            ax.text(datetime.date.fromisoformat(s['wealth_since']), ax.get_ylim()[0],
-                    f" 總資產自 {s['wealth_since'][5:]} 起記錄", fontproperties=font, fontsize=9,
-                    color='#666', va='bottom')
-    ax.annotate(f"{stocks[-1]:,.0f}", (dates[-1], stocks[-1]), textcoords='offset points',
-                xytext=(6, -14), fontproperties=font, fontsize=10, color='#1f4e9c')
-
-    ax.set_title(f"總資產走勢　{s['month']} {'月結' if month_end else '月中快照'}"
-                 f"　（資料截至 {s['date']}）", fontproperties=font, fontsize=14)
-    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f'{v/1e6:.1f}M' if v >= 1e6 else f'{v:,.0f}'))
-    ax.xaxis.set_major_locator(mdates.MonthLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-    ax.grid(True, color='#e6e6e6', linewidth=0.8)
-    for lbl in ax.get_xticklabels() + ax.get_yticklabels():
-        lbl.set_fontproperties(font)
-    ax.legend(prop=font, loc='upper left', frameon=False)
-    ax.set_ylabel('元', fontproperties=font)
+    fmt = FuncFormatter(lambda v, _: f'{v/1e6:.1f}M' if abs(v) >= 1e6 else f'{v:,.0f}')
+    if layout == 'bars':
+        fig, ax_b = plt.subplots(figsize=(12, 6.5), dpi=110)
+        axes = [ax_b]
+    else:
+        fig, (ax_b, ax_l) = plt.subplots(2, 1, figsize=(12, 9), dpi=110,
+                                         gridspec_kw={'height_ratios': [3, 2]})
+        axes = [ax_b, ax_l]
+        _draw_lines(ax_l, history, s, months_back, font)
+    _draw_bars(ax_b, history, s, months_back, font, month_end)
+    for ax in axes:
+        ax.yaxis.set_major_formatter(fmt)
+        for lbl in ax.get_yticklabels() + ax.get_xticklabels():
+            lbl.set_fontproperties(font)
+        ax.set_ylabel('元', fontproperties=font)
+    fig.suptitle(f"總資產　{s['month']} {'月結' if month_end else '月中快照'}　（資料截至 {s['date']}）",
+                 fontproperties=font, fontsize=14)
     fig.tight_layout()
     buf = io.BytesIO()
     fig.savefig(buf, format='png')
@@ -260,7 +301,9 @@ def run(month=None, send=True, force=False, to=None):
     test can never make the real month-end look already sent."""
     cfg = dashboard.load_bot_config()
     mcfg = cfg.get('monthly') or {}
-    if not mcfg.get('enabled', True) and not to:
+    if send and not to and not mcfg.get('enabled', True):
+        # The switch gates the REAL scheduled send only. A --dry-run preview or a
+        # --to test must work while the schedule is off — that is when they matter.
         print(f"[{_now()}] Monthly wealth push disabled in bot_config.")
         return None
     today = taipei_today()
@@ -278,7 +321,8 @@ def run(month=None, send=True, force=False, to=None):
     text = build_text(s, month_end=month_end)
     png = None
     try:
-        png = build_png(history, s, months_back=int(mcfg.get('months_back', 12)), month_end=month_end)
+        png = build_png(history, s, months_back=int(mcfg.get('months_back', 12)), month_end=month_end,
+                        layout=mcfg.get('layout', 'bars+line'))
     except Exception as exc:                                         # noqa: BLE001
         print(f"[{_now()}] Picture skipped: {type(exc).__name__}: {exc}")
         text += "\n⚠️ 本月圖表產生失敗，僅附文字"
