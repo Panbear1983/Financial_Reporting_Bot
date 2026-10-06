@@ -304,8 +304,11 @@ def build_live_table(portfolio, quotes, market_open=None, streaks=None,
     cash = tot.get('cash')            # None unless a cash ledger exists
     if cash is not None:
         # Brokerage cash, pinned under the holdings. Never priced, never in P/L.
-        t.add_row('', '[bold yellow]CASH[/bold yellow]', '現金 / 活存餘額', '', '—', '—',
-                  f'{cash:,.0f}', '—', '—', '—', '—', '')
+        # Peter 2026-10-06: the whole row in bright yellow, every field — the row
+        # style applies to all twelve cells, so it is not a stock row in disguise.
+        t.add_row('', 'CASH', '現金 / 活存餘額', '', '—', '—',
+                  f'{cash:,.0f}', '—', '—', '—', '—', '',
+                  style='bold bright_yellow')
     if tot['value']:
         # Say so when the Total covers only part of the book, so a shrunken
         # figure is never mistaken for the market moving.
