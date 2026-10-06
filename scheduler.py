@@ -15,7 +15,7 @@ time.tzset()
 
 def _load_bot_config():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir   = os.getenv('OPENCLAW_DATA_DIR', os.path.join(script_dir, 'data'))
+    data_dir   = os.getenv('FRB_DATA_DIR', os.path.join(script_dir, 'data'))
     for directory in (data_dir, script_dir):
         path = os.path.join(directory, 'bot_config.json')
         if os.path.exists(path):
@@ -47,8 +47,35 @@ if SANDBOX:
 # ---------------------------------------------------------------------------
 
 def is_taiwan_weekday():
+    """True when the Taiwan exchange actually trades today.
+
+    Named for Mon–Fri, which is all it used to check — and on 2026-09-25 (中秋節)
+    that published a full morning report against a closed market, quoting the
+    previous session's prices as today's. It now also consults TWSE's own
+    holiday calendar via the data layer, falling back to the weekday test if
+    that calendar can't be reached.
+    """
     taiwan_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-    return taiwan_now.weekday() < 5  # Mon=0, Fri=4
+    if taiwan_now.weekday() >= 5:
+        print("Taiwan market closed today — weekend.", flush=True)
+        return False
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from dashboard import market_holiday_name
+        holiday = market_holiday_name(taiwan_now.date())
+    except Exception as exc:                                       # noqa: BLE001
+        print(f"Holiday check unavailable ({type(exc).__name__}: {exc}) — "
+              f"treating as a trading day.", flush=True)
+        return True
+    if holiday:
+        print(f"Taiwan market closed today — {holiday}.", flush=True)
+        return False
+    if holiday is None:
+        # Say so out loud. Falling back to Mon–Fri without a word is exactly how
+        # the 中秋節 report got published in the first place.
+        print("⚠ Holiday calendar unavailable — falling back to the weekday test, "
+              "so a public holiday could slip through today.", flush=True)
+    return True
 
 
 def _sandbox_label():
@@ -57,7 +84,8 @@ def _sandbox_label():
 
 def run_report(mode='closing'):
     if not is_taiwan_weekday():
-        print(f"Skipping {mode} report — weekend in Taiwan.", flush=True)
+        # The reason (weekend / which holiday) is printed by the check itself.
+        print(f"Skipping {mode} report — not a trading day.", flush=True)
         return
     print(f"Executing TWSE {mode} report...{_sandbox_label()}", flush=True)
     result = subprocess.run([sys.executable, 'twse_daily_report.py', f'--mode={mode}'])
@@ -65,10 +93,79 @@ def run_report(mode='closing'):
     print(f"TWSE {mode} report executed {status}.", flush=True)
 
 
+def run_streak_alert():
+    """Post-close push naming holdings on a 3+ session run (streak_alert.py)."""
+    if not is_taiwan_weekday():
+        print("Skipping streak alert — not a trading day.", flush=True)
+        return
+    print(f"Executing streak alert...{_sandbox_label()}", flush=True)
+    result = subprocess.run([sys.executable, 'streak_alert.py'])
+    status = 'successfully' if result.returncode == 0 else f'failed (code {result.returncode})'
+    print(f"Streak alert executed {status}.", flush=True)
+
+
+def _monthly_sent(month):
+    """True once the month's wealth push is archived (data/reports/wealth_YYYY-MM.md)."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir   = os.getenv('FRB_DATA_DIR', os.path.join(script_dir, 'data'))
+    return os.path.exists(os.path.join(data_dir, 'reports', f'wealth_{month}.md'))
+
+
+def _monthly_has_data(month):
+    """True when at least one closing snapshot in `month` recorded total wealth —
+    cash was first written down on 2026-10-05, so September can never qualify
+    and a fresh install cannot fire a catch-up for a month it never measured."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from dashboard import wealth_history
+        return any(r['date'].startswith(month) and r['total_wealth'] is not None
+                   for r in wealth_history())
+    except Exception:                                              # noqa: BLE001
+        return False
+
+
+def monthly_due(taipei_today, late_days=7):
+    """Which month's wealth push is owed right now, or None.
+
+    Peter's rule (2026-10-05): the LAST CALENDAR DAY of every month, holiday or
+    not. Two cases:
+      * today IS that day and this month's push is not out yet -> this month;
+      * the previous month ended within the last `late_days` days, its push
+        never went out (the Mac was asleep, the bot was down) and we do have
+        total-wealth data for it -> that month, now. Beyond `late_days` it is
+        left alone rather than surfacing a weeks-old "month-end" as news.
+    """
+    this_month = taipei_today.strftime('%Y-%m')
+    last_day = ((taipei_today.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
+                - datetime.timedelta(days=1))
+    if taipei_today == last_day and not _monthly_sent(this_month):
+        return this_month
+    prev_end = taipei_today.replace(day=1) - datetime.timedelta(days=1)
+    prev = prev_end.strftime('%Y-%m')
+    if (0 < (taipei_today - prev_end).days <= late_days
+            and not _monthly_sent(prev) and _monthly_has_data(prev)):
+        return prev
+    return None
+
+
+def run_monthly_wealth():
+    """Month-end total-wealth push (monthly_wealth.py). NO trading-day gate — the
+    month ends on the calendar, and on a weekend or holiday the figures are
+    simply the last trading day's close, which the push labels."""
+    taipei_today = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).date()
+    month = monthly_due(taipei_today)
+    if not month:
+        return
+    print(f"Executing month-end wealth push for {month}...{_sandbox_label()}", flush=True)
+    result = subprocess.run([sys.executable, 'monthly_wealth.py', f'--month={month}'])
+    status = 'successfully' if result.returncode == 0 else f'failed (code {result.returncode})'
+    print(f"Month-end wealth push executed {status}.", flush=True)
+
+
 def _report_exists_today(mode):
     """True if a report for today's UTC date and this mode was already archived."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir   = os.getenv('OPENCLAW_DATA_DIR', os.path.join(script_dir, 'data'))
+    data_dir   = os.getenv('FRB_DATA_DIR', os.path.join(script_dir, 'data'))
     reports    = os.path.join(data_dir, 'reports')
     today      = datetime.datetime.utcnow().strftime('%Y-%m-%d')
     try:
@@ -78,24 +175,44 @@ def _report_exists_today(mode):
         return False
 
 
-def catch_up_missed(morning_utc, closing_utc):
-    """Run any slot that already passed today without producing a report.
+def _streak_ran_today():
+    """True if streak_alert.py already ran for today's Taipei date (its state file)."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir   = os.getenv('FRB_DATA_DIR', os.path.join(script_dir, 'data'))
+    taipei_today = (datetime.datetime.utcnow() + datetime.timedelta(hours=8)).strftime('%Y-%m-%d')
+    try:
+        with open(os.path.join(data_dir, 'streak_alert_state.json')) as f:
+            return json.load(f).get('last_run') == taipei_today
+    except (FileNotFoundError, ValueError):
+        return False
+
+
+def catch_up_missed(morning_utc, closing_utc, streak_utc):
+    """Run any slot that already passed today without leaving its record.
 
     `schedule` has no catch-up: a restart or clock step past a slot silently
     skips that run until the next day. On startup we backfill once so a missed
-    morning/closing push self-heals. SANDBOX is honoured via run_report().
+    morning/closing push (or streak alert) self-heals. SANDBOX is honoured via
+    run_report() / streak_alert.py.
     """
     now = datetime.datetime.utcnow()
-    for mode, at in (('morning', morning_utc), ('closing', closing_utc)):
+    slots = (
+        ('morning', morning_utc, lambda: _report_exists_today('morning'),
+         lambda: run_report(mode='morning')),
+        ('closing', closing_utc, lambda: _report_exists_today('closing'),
+         lambda: run_report(mode='closing')),
+        ('streak',  streak_utc,  _streak_ran_today, run_streak_alert),
+    )
+    for name, at, done_today, run in slots:
         try:
             hh, mm = map(int, at.split(':'))
         except ValueError:
             continue
         slot = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if now >= slot and is_taiwan_weekday() and not _report_exists_today(mode):
-            print(f"Catch-up: {mode} {at} UTC slot passed with no report today — running now.",
+        if now >= slot and is_taiwan_weekday() and not done_today():
+            print(f"Catch-up: {name} {at} UTC slot passed with nothing recorded today — running now.",
                   flush=True)
-            run_report(mode=mode)
+            run()
 
 
 # ---------------------------------------------------------------------------
@@ -107,11 +224,17 @@ if NOW_MODE:
     print(f"{label} Running {NOW_MODE} report immediately...", flush=True)
     if NOW_MODE in ('morning', 'closing'):
         run_report(mode=NOW_MODE)
+    elif NOW_MODE == 'streak':
+        run_streak_alert()
+    elif NOW_MODE == 'monthly':
+        print(f"Executing month-end wealth push (this month to date)...{_sandbox_label()}", flush=True)
+        subprocess.run([sys.executable, 'monthly_wealth.py', '--force'])
     elif NOW_MODE == 'all':
         run_report(mode='morning')
         run_report(mode='closing')
+        run_streak_alert()
     else:
-        print(f"Unknown --now mode: {NOW_MODE}. Valid: morning, closing, all", flush=True)
+        print(f"Unknown --now mode: {NOW_MODE}. Valid: morning, closing, streak, monthly, all", flush=True)
         sys.exit(1)
     sys.exit(0)
 
@@ -121,24 +244,48 @@ if NOW_MODE:
 # ---------------------------------------------------------------------------
 
 # Schedule times loaded from bot_config.json (falls back to hardcoded defaults)
-_morning_utc  = _sched.get('morning_utc',  '01:30')
+_morning_utc  = _sched.get('morning_utc',  '01:05')
 _closing_utc  = _sched.get('closing_utc',  '08:00')
+_streak_utc   = _sched.get('streak_utc',   '08:05')   # after the closing report
+_monthly_utc  = _sched.get('monthly_utc',  '08:20')   # after the close has been recorded
 
 schedule.every().day.at(_morning_utc).do(run_report, mode='morning')
 schedule.every().day.at(_closing_utc).do(run_report, mode='closing')
+schedule.every().day.at(_streak_utc).do(run_streak_alert)
+schedule.every().day.at(_monthly_utc).do(run_monthly_wealth)   # self-gated: fires on month-end only
 
 if SANDBOX:
     print("━" * 55, flush=True)
     print("  SANDBOX MODE ACTIVE — no messages will reach Telegram", flush=True)
-    print("  Preview files saved to OPENCLAW_DATA_DIR on each run", flush=True)
+    print("  Preview files saved to FRB_DATA_DIR on each run", flush=True)
     print("━" * 55, flush=True)
 
 print("Scheduler started. Waiting for next scheduled run...", flush=True)
-print(f"  - TWSE morning:   {_morning_utc} UTC — weekdays, yfinance live", flush=True)
+
+# Pull the holiday calendar down now (and next year's, once TWSE issues it in the
+# autumn) so no job ever has to depend on the exchange being reachable at the
+# moment it fires — least of all the first run after the year turns over.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from dashboard import warm_holiday_cache
+    for _yr, _n in warm_holiday_cache().items():
+        print(f"  - Holidays ROC {_yr}: "
+              + (f"{_n} closed days cached" if _n else "not published yet"), flush=True)
+except Exception as _exc:                                          # noqa: BLE001
+    print(f"  - Holiday calendar warm-up skipped: {type(_exc).__name__}: {_exc}", flush=True)
+print(f"  - TWSE morning:   {_morning_utc} UTC — weekdays, exchange real-time (mis.twse.com.tw)", flush=True)
 print(f"  - TWSE closing:   {_closing_utc} UTC — weekdays, TWSE official", flush=True)
+print(f"  - Streak alert:   {_streak_utc} UTC — weekdays, holdings on a 3+ session run", flush=True)
+print(f"  - Month-end wealth: {_monthly_utc} UTC — last calendar day of the month, holiday or not", flush=True)
 
 # Backfill a slot we slept through (restart / clock step) so a missed push self-heals.
-catch_up_missed(_morning_utc, _closing_utc)
+catch_up_missed(_morning_utc, _closing_utc, _streak_utc)
+# The month-end push catches itself up: monthly_due() answers "the previous month
+# ended a few days ago and its push never went out", which is exactly the Mac-
+# was-asleep-on-the-31st case. Only after the slot time, so a restart on the last
+# day itself never sends early.
+if datetime.datetime.utcnow().strftime('%H:%M') >= _monthly_utc:
+    run_monthly_wealth()
 
 while True:
     schedule.run_pending()
