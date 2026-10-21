@@ -753,7 +753,7 @@ def menu_cash():
                             ('Balance 餘額', dict(justify='right')), ('Note 備註', {}),
                             ('Entered 輸入', dict(style='dim'))]:
                 t.add_column(col, **kw)
-            for e in entries[-20:]:
+            for e in sorted(entries, key=lambda x: x['date'], reverse=True)[:20]:
                 amt = e['amount']
                 # TW convention, same as every other figure on these screens:
                 # red = money in, green = money out. Western ledgers do the

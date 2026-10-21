@@ -1097,7 +1097,12 @@ def edit_cash_entry(entry_id, value=None, note=None, date=None):
             new_value = float(str(value).replace(',', '').strip())
         except ValueError:
             raise ValueError('金額必須是數字') from None
-        if new_value != new_value or new_value < 0 or new_value > CASH_MAX_AMOUNT:
+        if new_value != new_value or new_value > CASH_MAX_AMOUNT:
+            raise ValueError('金額必須是合理數字') from None
+        if kind in ('deposit', 'withdraw') and new_value <= 0:
+            raise ValueError('存入／提出金額必須大於 0') from None
+        if kind == 'update' and new_value < -1e9:
+            raise ValueError('更新金額過大（絕對值超過 10 億元）') from None
             raise ValueError('金額必須是 0 以上的合理數字')
         if kind in ('deposit', 'withdraw') and new_value == 0:
             raise ValueError('存入／提出金額必須大於 0')
@@ -1137,16 +1142,41 @@ def edit_cash_entry(entry_id, value=None, note=None, date=None):
     stamp = datetime.datetime.now(ZoneInfo('Asia/Taipei')).strftime('%Y-%m-%d %H:%M:%S')
     e['edited_at'] = stamp
     e['edits'] = list(old.get('edits', [])) + [{'at': stamp, 'before': before}]
-    _replay_cash(new_entries)                         # raises before anything is written
-
+    # only the requested fields change; NO _replay_cash cascade
+    import copy
+    new_entries = copy.deepcopy(entries)
+    e = new_entries[idx]
+    if kind == 'update':
+        e['balance_after'] = round(new_value, 2)
+        # re-derive amount as the difference from the previous balance
+        # find the balance before this entry
+        prev_bal = None
+        for prev_e in new_entries[:idx]:
+            if prev_e['type'] == 'open':
+                if prev_bal is None:
+                    prev_bal = prev_e['amount']
+            elif prev_bal is not None:
+                prev_bal = round(prev_bal + prev_e['amount'], 2)
+        if prev_bal is not None:
+            e['amount'] = round(e['balance_after'] - prev_bal, 2)
+    elif kind in ('deposit', 'withdraw'):
+        e['amount'] = round(new_value, 2)
+    else:  # open
+        e['amount'] = round(new_value, 2)
+    e['date'], e['note'] = after['date'], after['note']
+    stamp = datetime.datetime.now(ZoneInfo('Asia/Taipei')).strftime('%Y-%m-%d %H:%M:%S')
+    e['edited_at'] = stamp
+    e['edits'] = list(old.get('edits', [])) + [{'at': stamp, 'before': before}]
+    # keep every other entry untouched; no _replay_cash
+    # but we must rewrite the file so the cache clears
     path = cash_ledger_path()
     with open(path, 'rb') as f:
         old_bytes = f.read()
     hist = os.path.join(DATA_DIR, CASH_HISTORY_DIR)
     os.makedirs(hist, exist_ok=True)
     with open(os.path.join(hist, f"cash_ledger_before_edit_{int(entry_id):04d}_"
-                                 f"{stamp.replace('-', '').replace(':', '').replace(' ', '_')}.jsonl"),
-              'wb') as f:
+                             f"{stamp.replace('-', '').replace(':', '').replace(' ', '_')}.jsonl"),
+                  'wb') as f:
         f.write(old_bytes)
     tmp = path + '.tmp'
     with open(tmp, 'wb') as f:
@@ -1156,8 +1186,6 @@ def edit_cash_entry(entry_id, value=None, note=None, date=None):
     os.replace(tmp, path)
     _cash_cache['key'] = None
     return e
-
-
 def compute_positions(portfolio, quotes, market_open=None, with_cash=True):
     """THE position maths for this project — rows + totals, no rendering.
 
