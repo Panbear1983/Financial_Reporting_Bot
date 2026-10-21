@@ -653,9 +653,8 @@ _CASH_HELP = {
 
 
 def _cash_entry(d, kind, note_default=''):
-    """Ask for one ledger entry and record it. Entries are final: a mistake is
-    fixed by adding a correcting entry, never by editing — that is what keeps
-    the ledger a track record."""
+    """Ask for one ledger entry and record it. A mistake can be corrected
+    afterwards with [e] Edit (the ledger keeps what it said before)."""
     label = d.CASH_TYPE_LABEL[kind]
     ask, explain = _CASH_HELP[kind]
     console.print(f'\n[bold]{label}[/bold]  [dim]{explain}[/dim]')
@@ -664,7 +663,7 @@ def _cash_entry(d, kind, note_default=''):
     note = Prompt.ask('Note 備註 — the reason' + ('' if kind == 'open' else ' (required)'),
                       default=note_default or ('初始餘額' if kind == 'open' else None))
     console.print(f'[dim]Will record: {label} {value} on {day} — {note or ""}. '
-                  f'Entries cannot be edited or deleted afterwards.[/dim]')
+                  f'You can correct it later with [e] Edit.[/dim]')
     if not Confirm.ask('Record it?', default=True):
         return None
     try:
@@ -675,6 +674,50 @@ def _cash_entry(d, kind, note_default=''):
     console.print(f"[green]✓ #{e['id']} {label} {e['amount']:+,.0f}元 → "
                   f"balance {e['balance_after']:,.0f}元[/green]")
     return e
+
+
+_EDIT_ASK = {
+    'open':     'Opening balance (元)',
+    'deposit':  'Amount deposited (元)',
+    'withdraw': 'Amount withdrawn (元)',
+    'update':   'Balance your broker showed (元)',
+}
+
+
+def _edit_cash_entry(d, entries):
+    """Peter 2026-10-21: "select the existing entries ... edit the number and
+    also the note, and then also the date". Pick by #, Enter keeps a field."""
+    ids = [str(e.get('id')) for e in entries]
+    pick = Prompt.ask('Which entry? (# from the table, Enter = cancel)', default='')
+    if not pick.strip():
+        return None
+    if pick.strip() not in ids:
+        console.print(f'[red]✗ no entry #{pick}[/red]')
+        return None
+    e = next(x for x in entries if str(x.get('id')) == pick.strip())
+    label = d.CASH_TYPE_LABEL.get(e['type'], e['type'])
+    cur = d.cash_entry_value(e)
+    console.print(f"\n[bold]Edit #{e['id']} {label}[/bold]  [dim]Enter keeps the current value. "
+                  f"Balances after it are recalculated"
+                  + ('; a later 調整 still means the balance the broker showed.' if e['type'] != 'update'
+                     else '.') + '[/dim]')
+    value = Prompt.ask(_EDIT_ASK.get(e['type'], 'Amount (元)'), default=f'{cur:,.0f}' if cur == int(cur)
+                       else f'{cur:,.2f}')
+    day = Prompt.ask('Date (YYYY-MM-DD)', default=e['date'])
+    note = Prompt.ask('Note 備註', default=e.get('note', '') or None) or ''
+    console.print(f"[dim]Was: {cur:,.0f} on {e['date']} — {e.get('note', '')}\n"
+                  f"Now: {value} on {day} — {note}[/dim]")
+    if not Confirm.ask('Save the change?', default=True):
+        return None
+    try:
+        new = d.edit_cash_entry(e['id'], value=value, note=note, date=day)
+    except ValueError as x:
+        console.print(f'[red]✗ {x}[/red]')
+        return None
+    st = d.cash_status()
+    console.print(f"[green]✓ #{new['id']} corrected → balance now {st['balance']:,.0f}元[/green]  "
+                  f"[dim](the ledger before this edit is kept in {d.CASH_HISTORY_DIR}/)[/dim]")
+    return new
 
 
 def menu_cash():
@@ -726,15 +769,19 @@ def menu_cash():
                 console.print(f'[dim]latest 20 of {len(entries)} entries[/dim]')
         if opened:
             console.print('\n[cyan]\\[d][/cyan] Deposit 存入  [cyan]\\[w][/cyan] Withdraw 提出  '
-                          '[cyan]\\[u][/cyan] Update balance 調整  [cyan]\\[b][/cyan] Back')
-            keys = {'d': 'deposit', 'w': 'withdraw', 'u': 'update'}
+                          '[cyan]\\[u][/cyan] Update balance 調整  [cyan]\\[e][/cyan] Edit an entry 修改  '
+                          '[cyan]\\[b][/cyan] Back')
+            keys = {'d': 'deposit', 'w': 'withdraw', 'u': 'update', 'e': 'edit'}
         else:
             console.print('\n[cyan]\\[o][/cyan] Opening balance 開帳  [cyan]\\[b][/cyan] Back')
             keys = {'o': 'open'}
         choice = Prompt.ask('Action', choices=list(keys) + ['b'], default='b')
         if choice == 'b':
             break
-        _cash_entry(d, keys[choice])
+        if keys[choice] == 'edit':
+            _edit_cash_entry(d, entries)
+        else:
+            _cash_entry(d, keys[choice])
         pause()
 
 

@@ -831,8 +831,10 @@ def taiwan_market_open(now=None):
 # balance, in a total, and as a share of that total. The repo tracks his
 # brokerage settlement account (交割戶) and nothing else.
 #
-# Every change is a typed, dated, noted entry that is never edited or deleted —
-# a mistake is fixed by a new entry saying so — so the ledger is a track
+# Every change is a typed, dated, noted entry that is never deleted. Since
+# 2026-10-21 an entry can be corrected (edit_cash_entry: number, date, note) at
+# Peter's request; the file before each correction is kept in CASH_HISTORY_DIR
+# and the entry carries its own 'edits' trail, so the ledger stays a track
 # record, and the balance is always replayed from it, never stored beside it.
 #
 #   open      the opening balance: day zero, counting starts here
@@ -1029,6 +1031,127 @@ def add_cash_entry(kind, value, note='', date=None):
     os.replace(tmp, path)
     _cash_cache['key'] = None
     return entry
+
+
+def cash_entry_value(e):
+    """The number Peter typed for an entry, which is what an edit changes: the
+    opening balance, the (positive) amount moved, or the balance the broker
+    showed for an update."""
+    if e['type'] == 'update':
+        return float(e.get('balance_after', 0.0))
+    return abs(float(e['amount']))
+
+
+def _replay_cash(entries):
+    """Recompute amount / balance_after for every entry, in the order written.
+
+    deposit / withdraw / open keep their amount; an update keeps the balance the
+    broker showed (that is the fact it records) and its difference is
+    re-derived. Raises ValueError if any point of the history goes negative."""
+    bal = None
+    for e in entries:
+        if e['type'] == 'open':
+            if bal is None:
+                bal = e['amount']
+                e['balance_after'] = round(bal, 2)
+            continue
+        if bal is None:
+            continue
+        if e['type'] == 'update':
+            e['amount'] = round(e['balance_after'] - bal, 2)
+        bal = round(bal + e['amount'], 2)
+        e['balance_after'] = bal
+        if bal < -1e-9:
+            raise ValueError(f"修改後 #{e.get('id')} 的餘額會變成負數（{bal:,.0f}元）")
+    return entries
+
+
+def edit_cash_entry(entry_id, value=None, note=None, date=None):
+    """Correct an existing entry's number, date and/or note (Peter 2026-10-21:
+    "select the existing entries ... edit the number and also the note, and
+    then also the date"). Returns the edited entry, or raises ValueError in
+    Chinese like add_cash_entry.
+
+    The ledger stays a track record: the file as it stood is copied to
+    CASH_HISTORY_DIR first, and the entry keeps an 'edits' list with what it
+    said before and when it changed. Balances after it are replayed; an update
+    further down still means "the broker showed this", so its balance holds."""
+    entries, bad = load_cash_ledger()
+    if bad:
+        raise ValueError(f'現金帳本有 {bad} 行無法讀取 — 請先檢查 {cash_ledger_path()}，'
+                         f'不修改以免帳目錯亂')
+    idx = next((i for i, e in enumerate(entries) if int(e.get('id', 0)) == int(entry_id)), None)
+    if idx is None:
+        raise ValueError(f'找不到第 {entry_id} 筆紀錄')
+    old = entries[idx]
+    kind = old['type']
+    before = {'value': cash_entry_value(old), 'date': old['date'], 'note': old.get('note', '')}
+
+    new_value = before['value']
+    if value is not None and str(value).strip() != '':
+        try:
+            new_value = float(str(value).replace(',', '').strip())
+        except ValueError:
+            raise ValueError('金額必須是數字') from None
+        if new_value != new_value or new_value < 0 or new_value > CASH_MAX_AMOUNT:
+            raise ValueError('金額必須是 0 以上的合理數字')
+        if kind in ('deposit', 'withdraw') and new_value == 0:
+            raise ValueError('存入／提出金額必須大於 0')
+    new_note = before['note'] if note is None else note.strip()[:200]
+    if kind != 'open' and not new_note:
+        raise ValueError('請寫下這筆紀錄的原因')
+    today = _taipei_today()
+    try:
+        new_day = datetime.date.fromisoformat(str(date)) if date else \
+            datetime.date.fromisoformat(before['date'])
+    except ValueError:
+        raise ValueError('日期格式應為 YYYY-MM-DD') from None
+    if new_day > today:
+        raise ValueError('日期不能在未來')
+    opening = next((e for e in entries if e['type'] == 'open'), None)
+    if kind == 'open':
+        later = [e['date'] for e in entries if e is not old]
+        if later and new_day.isoformat() > min(later):
+            raise ValueError(f'開帳日不能晚於其他紀錄的日期 {min(later)}')
+    elif opening and new_day.isoformat() < opening['date']:
+        raise ValueError(f"日期不能早於開帳日 {opening['date']}")
+
+    after = {'value': round(new_value, 2), 'date': new_day.isoformat(), 'note': new_note}
+    if after == {**before, 'value': round(before['value'], 2)}:
+        raise ValueError('沒有任何變更')
+
+    import copy
+    new_entries = copy.deepcopy(entries)
+    e = new_entries[idx]
+    if kind == 'update':
+        e['balance_after'] = round(new_value, 2)
+    elif kind == 'withdraw':
+        e['amount'] = -round(new_value, 2)
+    else:
+        e['amount'] = round(new_value, 2)
+    e['date'], e['note'] = after['date'], after['note']
+    stamp = datetime.datetime.now(ZoneInfo('Asia/Taipei')).strftime('%Y-%m-%d %H:%M:%S')
+    e['edited_at'] = stamp
+    e['edits'] = list(old.get('edits', [])) + [{'at': stamp, 'before': before}]
+    _replay_cash(new_entries)                         # raises before anything is written
+
+    path = cash_ledger_path()
+    with open(path, 'rb') as f:
+        old_bytes = f.read()
+    hist = os.path.join(DATA_DIR, CASH_HISTORY_DIR)
+    os.makedirs(hist, exist_ok=True)
+    with open(os.path.join(hist, f"cash_ledger_before_edit_{int(entry_id):04d}_"
+                                 f"{stamp.replace('-', '').replace(':', '').replace(' ', '_')}.jsonl"),
+              'wb') as f:
+        f.write(old_bytes)
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as f:
+        f.write(''.join(json.dumps(x, ensure_ascii=False) + '\n' for x in new_entries).encode('utf-8'))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _cash_cache['key'] = None
+    return e
 
 
 def compute_positions(portfolio, quotes, market_open=None, with_cash=True):

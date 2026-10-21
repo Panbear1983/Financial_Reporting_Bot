@@ -187,6 +187,44 @@ try:
 except ValueError:
     check('writes are refused while a line is unreadable', True)
 
+# 7b. Editing an existing entry (Peter 2026-10-21: number, note, date).
+os.remove(d.cash_ledger_path()); d._cash_cache['key'] = None
+d.add_cash_entry('open', 450000, '', date='2026-09-28')
+d.add_cash_entry('deposit', 50000, '薪資轉入', date='2026-09-29')
+d.add_cash_entry('update', 512400, '0050 配息入帳', date='2026-09-30')
+d.add_cash_entry('withdraw', 20000, '個人開銷', date='2026-10-01')
+_n_hist = len(os.listdir(os.path.join(_tmp, d.CASH_HISTORY_DIR)))
+e2 = d.edit_cash_entry(2, value='60,000', note='薪資轉入（更正）', date='2026-09-30')
+st = d.cash_status()
+check('editing a deposit keeps the later broker balance (update still says 512,400)',
+      st['balance'] == 492400.0, str(st['balance']))
+_led, _ = d.load_cash_ledger()
+check('the update after it re-derives its difference (512,400 − 510,000 = +2,400)',
+      _led[2]['amount'] == 2400.0 and _led[2]['balance_after'] == 512400.0, str(_led[2]))
+check('net flow follows the corrected deposit (+40,000)', st['net_flow'] == 40000.0, str(st['net_flow']))
+check('the edited entry carries its new date, note, and what it said before',
+      e2['date'] == '2026-09-30' and e2['note'] == '薪資轉入（更正）'
+      and e2['edits'][-1]['before'] == {'value': 50000.0, 'date': '2026-09-29', 'note': '薪資轉入'})
+check('an edit keeps a copy of the ledger before it',
+      len(os.listdir(os.path.join(_tmp, d.CASH_HISTORY_DIR))) == _n_hist + 1)
+d.edit_cash_entry(3, value=500000)
+check('editing an update sets the balance the broker showed', d.cash_status()['balance'] == 480000.0)
+d.edit_cash_entry(1, value=460000, note='初始餘額')
+check('editing the opening balance shifts deposits, but a later update holds',
+      d.cash_status()['balance'] == 480000.0 and d.load_cash_ledger()[0][2]['amount'] == -20000.0)
+for args, kw, why in (((4,), {'value': 10**9}, 'an edit that makes a balance negative'),
+                      ((2,), {'date': '2099-01-01'}, 'a future date'),
+                      ((2,), {'date': '2026-09-01'}, 'a date before opening'),
+                      ((2,), {'note': ''}, 'an empty note'),
+                      ((99,), {'value': 1}, 'an unknown #'),
+                      ((2,), {}, 'no change at all')):
+    _before = open(d.cash_ledger_path(), 'rb').read()
+    try:
+        d.edit_cash_entry(*args, **kw)
+        check(f'{why} is refused', False)
+    except ValueError:
+        check(f'{why} is refused, file untouched', open(d.cash_ledger_path(), 'rb').read() == _before)
+
 # 8. The morning voice reads the short slice only, and the closing voice is untouched.
 morning = ("📊 2026-10-05 台股開盤快報\n🕐 價格時間 09:05:12（證交所即時）\n\n🌙 隔夜與開盤：\n"
            "• 加權指數：昨收 1 → 開盤 2 → 現 3（+1.00%）\n• S&P 500：1 (+1%)\n\n🎯 **持倉（今日）：**\n"
