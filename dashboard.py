@@ -1034,20 +1034,24 @@ def add_cash_entry(kind, value, note='', date=None):
 
 
 def cash_entry_value(e):
-    """The number Peter typed for an entry, which is what an edit changes: the
-    opening balance, the (positive) amount moved, or the balance the broker
-    showed for an update."""
-    if e['type'] == 'update':
-        return float(e.get('balance_after', 0.0))
-    return abs(float(e['amount']))
+    """The number an edit changes — the Amount column (Peter 2026-10-21: "instead
+    of tweaking the balance field, we were actually tweaking the amount field").
+    The opening balance, the (positive) amount moved for deposit / withdraw, or
+    the signed difference (+ in / − out) for an update."""
+    if e['type'] in ('deposit', 'withdraw'):
+        return abs(float(e['amount']))
+    return float(e['amount'])
 
 
 def _replay_cash(entries):
-    """Recompute amount / balance_after for every entry, in the order written.
+    """Recompute balance_after for every entry, in the order written.
 
-    deposit / withdraw / open keep their amount; an update keeps the balance the
-    broker showed (that is the fact it records) and its difference is
-    re-derived. Raises ValueError if any point of the history goes negative."""
+    Amounts are the facts: open, deposit, withdraw, and update each keep the
+    amount Peter typed. balance_after after each line = open + Σ amount up to
+    that line. The update line's amount itself is re-derived as the balance
+    that entry recorded minus the balance before it (so later balances still
+    stay consistent). Raises ValueError if any point of the history goes
+    negative."""
     bal = None
     for e in entries:
         if e['type'] == 'open':
@@ -1058,7 +1062,7 @@ def _replay_cash(entries):
         if bal is None:
             continue
         if e['type'] == 'update':
-            e['amount'] = round(e['balance_after'] - bal, 2)
+            e['amount'] = round(e['balance_after'] - bal, 2)   # ← re-derive
         bal = round(bal + e['amount'], 2)
         e['balance_after'] = bal
         if bal < -1e-9:
