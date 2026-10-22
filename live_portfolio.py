@@ -32,6 +32,13 @@ from rich import box
 
 from custom_stock_lookup import get_yfinance_data
 
+# Data comes from the dashboard's single data layer — this module only draws.
+from dashboard import (_OHLC, _QUOTE_URL, _clean_bars, _quote_time, _suffix_cache_path,
+                       close_streak, compute_positions, fetch_history, fetch_live_quotes,
+                       open_gap_threshold, opening_gaps, settled_closes,
+                       fetch_quote_batch, resolve_any, resolve_symbols,
+                       taiwan_market_open)
+
 # ---------------------------------------------------------------------------
 # Ranges: key -> (label, yfinance period, yfinance interval, cache TTL secs)
 # Intervals stay within yfinance limits (5m ~60d back, 30m ~60d, 1h ~730d).
@@ -47,118 +54,29 @@ RANGES = {
     '7': ('5Y',    '5y',  '1wk', 3600),
 }
 
-QUOTE_TTL_OPEN   = 150   # table refresh cadence during market hours
+# The live board's heartbeat. Affordable only because the quote path is ONE
+# batched request for the whole book (see fetch_quote_batch) — yf.download costs
+# one HTTP call per ticker, so a 15-holding portfolio on this cadence would be
+# 45 req/min and straight into the 429s that used to blank the board.
+QUOTE_TTL_OPEN   = 20    # live board cadence during market hours
 QUOTE_TTL_CLOSED = 600
-
-_OHLC = ['Open', 'High', 'Low', 'Close']
+# Daily closes behind the Streak / Run% columns: one batched daily download,
+# held for an hour. The cache is also thrown away the moment the market opens
+# or closes, so today's bar is dropped / added on time rather than up to an
+# hour late (see close_streak).
+DAILY_TTL        = 3600
+DAILY_RETRY      = 60    # min gap between daily-fetch attempts (Yahoo throttles)
+OPEN_GAP_RETRY   = 30    # ask the exchange for today's opens this often until all have opened
 
 
 # ---------------------------------------------------------------------------
 # Symbol resolution (.TW vs .TWO) with a persistent cache
 # ---------------------------------------------------------------------------
 
-def _suffix_cache_path(data_dir):
-    return Path(data_dir) / 'ticker_suffix_cache.json'
-
-
-def resolve_symbols(codes, data_dir):
-    """Return {code: full_symbol}. Probes .TW then .TWO once per unknown code
-    and persists the result so refresh cycles never re-probe."""
-    cache_path = _suffix_cache_path(data_dir)
-    try:
-        cache = json.loads(cache_path.read_text(encoding='utf-8'))
-    except Exception:
-        cache = {}
-    dirty = False
-    out = {}
-    for code in codes:
-        suffix = cache.get(code)
-        if suffix not in ('.TW', '.TWO'):
-            suffix = '.TW'
-            for s in ('.TW', '.TWO'):
-                try:
-                    hist = yf.Ticker(f'{code}{s}').history(period='5d')
-                    if not hist.empty:
-                        suffix = s
-                        break
-                except Exception:
-                    continue
-            cache[code] = suffix
-            dirty = True
-        out[code] = f'{code}{suffix}'
-    if dirty:
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(json.dumps(cache, indent=2), encoding='utf-8')
-        except Exception:
-            pass
-    return out
-
-
-_TW_CODE_RE = re.compile(r'^\d{4,6}[A-Z]?$')
-
-
-def resolve_any(text, data_dir):
-    """Resolve arbitrary user input to a yfinance symbol. TW-style codes
-    (2330, 00402A) probe .TW/.TWO via the cache; anything else (AAPL, NVDA,
-    ^TWII, BTC-USD) passes through uppercased."""
-    text = text.strip().upper()
-    if not text:
-        return None
-    if _TW_CODE_RE.match(text):
-        return resolve_symbols([text], data_dir)[text]
-    return text
-
 
 # ---------------------------------------------------------------------------
 # Data fetching
 # ---------------------------------------------------------------------------
-
-def _clean_bars(sub):
-    """Drop all-NaN rows and null out non-positive prices (bad Yahoo ticks
-    would otherwise plot as candles crashing to zero)."""
-    sub = sub.dropna(how='all').copy()
-    cols = [c for c in _OHLC if c in sub.columns]
-    sub[cols] = sub[cols].where(sub[cols] > 0)
-    sub = sub.dropna(subset=cols, how='any')
-    # Normalize intraday timestamps to Taipei so charts show 09:00–13:30 and
-    # cross-symbol index unions never mix timezones.
-    if getattr(sub.index, 'tz', None) is not None:
-        sub.index = sub.index.tz_convert('Asia/Taipei')
-    return sub
-
-
-def fetch_history(symbols, period, interval):
-    """One batched download for all symbols → {symbol: DataFrame(OHLCV)}."""
-    df = yf.download(list(symbols), period=period, interval=interval,
-                     group_by='ticker', auto_adjust=False,
-                     threads=True, progress=False)
-    out = {}
-    if df is None or df.empty:
-        return out
-    if isinstance(df.columns, pd.MultiIndex):
-        for sym in symbols:
-            if sym in df.columns.get_level_values(0):
-                sub = _clean_bars(df[sym])
-                if not sub.empty:
-                    out[sym] = sub
-    else:                                   # single-ticker downloads come back flat
-        sub = _clean_bars(df)
-        if not sub.empty:
-            out[list(symbols)[0]] = sub
-    return out
-
-
-def fetch_live_quotes(codes, symbol_map):
-    """{code: quote_dict} via the Yahoo v8 chart API (cheap, one call/stock)."""
-    def one(code):
-        return code, get_yfinance_data(symbol_map[code])
-    quotes = {}
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        for code, q in ex.map(one, codes):
-            if q:
-                quotes[code] = q
-    return quotes
 
 
 def portfolio_ohlc(hist, portfolio, symbol_map, quotes=None):
@@ -200,40 +118,107 @@ def portfolio_ohlc(hist, portfolio, symbol_map, quotes=None):
     return total[keep], len(flat)
 
 
-def taiwan_market_open(now=None):
-    if os.getenv('LIVE_PORTFOLIO_FORCE_OPEN') == '1':
-        return True
-    now = now or datetime.datetime.now(ZoneInfo('Asia/Taipei'))
-    if now.weekday() >= 5:
-        return False
-    t = now.time()
-    return datetime.time(9, 0) <= t <= datetime.time(13, 30)
-
-
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
-def candle_renderable(ohlc_df, title, width, height, hline=None):
-    """plotext candlestick → ANSI → rich Text (embeddable in Live/Group)."""
+def candle_renderable(ohlc_df, title, width, height, hline=None, y_mode='linear'):
+    """plotext chart → ANSI → rich Text (embeddable in Live/Group).
+
+    y_mode: 'linear' → $ candlestick · 'log' → log-$ candlestick (equal % moves =
+    equal height, so fluctuation stays visible on long ranges where the portfolio
+    has grown a lot) · 'pct' → % change from the window's first bar (line)."""
     if ohlc_df is None or ohlc_df.empty:
         return Text('（無資料 / no data at this interval）', style='dim')
     if height < 8 or width < 40:
         return Text('Terminal too small for chart — resize to view.', style='yellow')
 
-    intraday = len(ohlc_df) > 1 and (ohlc_df.index[1] - ohlc_df.index[0]) < pd.Timedelta(days=1)
-    form, fmt = ('d/m H:M', '%d/%m %H:%M') if intraday else ('d/m/Y', '%d/%m/%Y')
+    idx = ohlc_df.index
+    intraday = len(idx) > 1 and (idx[1] - idx[0]) < pd.Timedelta(days=1)
+    span = (idx[-1] - idx[0]) if len(idx) > 1 else pd.Timedelta(0)
+    # Pick the shortest label that stays unambiguous, so the x-axis stays legible:
+    #   single intraday day → time only · multi-day intraday → d/m H:M
+    #   ≤ ~1 year of daily bars → d/m (the year is constant — repeating it is clutter)
+    #   multi-year → m/Y (individual days aren't meaningful at that zoom)
+    if intraday:
+        if span < pd.Timedelta(days=1):
+            form, fmt = ('H:M', '%H:%M')
+        else:
+            form, fmt = ('d/m H:M', '%d/%m %H:%M')
+    elif span > pd.Timedelta(days=400):
+        form, fmt = ('m/Y', '%m/%Y')
+    else:
+        form, fmt = ('d/m', '%d/%m')
 
     plt.clear_figure()
     plt.theme('clear')
     plt.date_form(form)
     plt.plotsize(width, height)
-    dates = [ts.strftime(fmt) for ts in ohlc_df.index]
-    plt.candlestick(dates, {c: ohlc_df[c].tolist() for c in _OHLC})
-    if hline:
-        plt.hline(hline, 'gray')
-    plt.title(title)
-    return Text.from_ansi(plt.build())
+    # plotext re-displays parsed times in the MACHINE's local tz (treating the
+    # naive string as UTC), which shifts intraday labels by the local offset —
+    # e.g. an 09:00 Taipei bar renders as 17:00 on a UTC+8 host. Pre-subtract the
+    # machine offset for time-bearing labels so plotext lands back on the real
+    # session time. Cross-env safe: the offset is 0 in the UTC container.
+    # Skip for date-only (daily/weekly) labels so a bar can't slip across midnight.
+    if intraday:
+        off = datetime.datetime.now().astimezone().utcoffset() or datetime.timedelta(0)
+        dates = [(ts - off).strftime(fmt) for ts in idx]
+    else:
+        dates = [ts.strftime(fmt) for ts in idx]
+    if y_mode == 'pct':
+        base = float(ohlc_df['Close'].iloc[0]) or 1.0
+        pcts = [(v / base - 1.0) * 100 for v in ohlc_df['Close'].tolist()]
+        # A single series can't be coloured bar-by-bar, so colour it by where it
+        # ends up over the window — TW convention again, red for a net gain.
+        plt.plot(dates, pcts, color=('red' if pcts[-1] > 0 else
+                                     'green' if pcts[-1] < 0 else 'white'))
+        plt.hline(0, 'gray')
+        plt.title(f'{title}  (% from start)')
+    else:
+        # TW convention: red = up, green = down. plotext's own default is the
+        # Western pair ['green', 'red'] (colors[0] is used when close > open),
+        # which reads as the exact OPPOSITE of the holdings table sitting
+        # directly above this chart. Pass the pair explicitly — never rely on
+        # the library default here.
+        plt.candlestick(dates, {c: ohlc_df[c].tolist() for c in _OHLC},
+                        colors=['red', 'green'])
+        # Zoom Y to the actual price band (+ margin) so real fluctuation is
+        # visible. Otherwise a break-even line far below the data (or just a
+        # large absolute base) stretches the axis and flattens the candles into
+        # a sliver at the top. The per-stock charts pass no hline and so already
+        # auto-fit this way — this brings the total chart in line with them.
+        lo = float(ohlc_df['Low'].min())
+        hi = float(ohlc_df['High'].max())
+        pad = (hi - lo) * 0.12 if hi > lo else (abs(hi) * 0.01 or 1.0)
+        ylo, yhi = lo - pad, hi + pad
+        note = ''
+        if hline:
+            if ylo <= hline <= yhi:
+                plt.hline(hline, 'gray')           # break-even in view — show it
+            else:
+                # Off-screen once zoomed: keep the break-even context as a title
+                # note instead of letting the line drag the axis back out.
+                last = float(ohlc_df['Close'].iloc[-1])
+                note = f'  ({(last / hline - 1.0) * 100:+.0f}% vs cost)'
+        if y_mode == 'log':
+            try:
+                plt.yscale('log')
+            except Exception:
+                pass
+            # Don't call plt.ylim() under log scale — this plotext version
+            # power10's the raw bounds and overflows. With the off-range hline
+            # gated out above, plotext already auto-fits log to the data band.
+            plt.title(f'{title}  (log $){note}')
+        else:
+            plt.ylim(ylo, yhi)
+            plt.title(f'{title}{note}')
+    # plotext sizes the title row by character count, so a CJK title (double-width
+    # cells) makes that one row overrun `width`. Clip every row to `width` so a
+    # full-width chart can never wrap and push the layout down a line.
+    rows = Text.from_ansi(plt.build()).split('\n')
+    for row in rows:
+        row.truncate(width)
+    return Text('\n').join(rows)
 
 
 def _fmt_signed(v, pct=False):
@@ -243,8 +228,48 @@ def _fmt_signed(v, pct=False):
     return f'[{color}]{s}[/{color}]'
 
 
-def build_live_table(portfolio, quotes):
-    t = Table(title='Portfolio Holdings — Live', box=box.ROUNDED)
+def _gap_arrow(gap, threshold):
+    """▲ / ▼ for today's opening gap vs yesterday's close — only when it is big
+    enough to mean something (see open_gap_threshold). TW colours: red up."""
+    if gap is None or abs(gap) < threshold:
+        return ''
+    return ' [red]▲[/red]' if gap > 0 else ' [green]▼[/green]'
+
+
+def _fmt_streak(streaks, code, gap=None, threshold=0.3):
+    """(Streak cell, Run% cell). streaks=None → daily bars not fetched yet;
+    a code missing from a fetched dict → no daily bars for it. gap is today's
+    opening gap in %, given only while the session is open; the arrow beside the
+    settled count is Peter's early warning that a run may be breaking."""
+    arrow = _gap_arrow(gap, threshold)
+    if streaks is None:
+        return '[dim]…[/dim]' + arrow, ''
+    sk = streaks.get(code)
+    if sk is None:
+        return '[dim]—[/dim]' + arrow, ''
+    if sk['run'] == 0:
+        return '[dim]0[/dim]' + arrow, '[dim]0.00%[/dim]'
+    color = 'red' if sk['run'] > 0 else 'green'      # TW convention, as above
+    return f"[{color}]{sk['run']:+d}[/{color}]" + arrow, _fmt_signed(sk['pct'], pct=True)
+
+
+def build_live_table(portfolio, quotes, market_open=None, streaks=None,
+                     open_gaps=None, gap_threshold=0.3):
+    """Rich rendering of compute_positions() for the live board.
+
+    streaks: {code: close_streak()} for the Streak / Run% columns, or None
+    while the daily bars are still being fetched.
+
+    Returns (table, n_unpriced, frozen_codes) — the latter two are the ways the
+    board can lie about being live: holdings with no quote at all (excluded from
+    the totals entirely) and holdings priced off the daily close because no
+    1-minute bar exists (shown, but unable to tick)."""
+    if market_open is None:
+        market_open = taiwan_market_open()
+    calc = compute_positions(portfolio, quotes, market_open)
+    # expand=True: span the full terminal width; Live re-renders 4×/s, so the
+    # table tracks the window as it is resized.
+    t = Table(title='Portfolio Holdings — Live', box=box.ROUNDED, expand=True)
     for col, kw in [('#', dict(style='dim', width=3, justify='right')),
                     ('Code', dict(style='bold cyan', width=8)),
                     ('Name', dict(width=14)),
@@ -253,35 +278,63 @@ def build_live_table(portfolio, quotes):
                     ('Chg%', dict(justify='right')),
                     ('Mkt Value', dict(justify='right')),
                     ('P/L', dict(justify='right')),
-                    ('P/L%', dict(justify='right'))]:
+                    ('P/L%', dict(justify='right')),
+                    ('Daily P/L', dict(justify='right')),
+                    ('Streak', dict(justify='right')),
+                    ('Run%', dict(justify='right'))]:
         t.add_column(col, **kw)
 
-    tot_val = tot_cost = 0.0
-    for i, (code, pos) in enumerate(portfolio.items(), 1):
-        sh, cost = pos.get('shares', 0), pos.get('cost_basis', 0)
-        q = quotes.get(code)
-        tot_cost += cost
-        if q:
-            price = q['price']
-            chg_pct = (price - q['prev_close']) / q['prev_close'] * 100 if q['prev_close'] else 0
-            val = price * sh
-            pnl = val - cost
-            pnl_pct = pnl / cost * 100 if cost else 0
-            tot_val += val
-            t.add_row(str(i), code, pos.get('name', ''), f'{sh:,}',
-                      f'{price:,.2f}', _fmt_signed(chg_pct, pct=True),
-                      f'{val:,.0f}', _fmt_signed(pnl), _fmt_signed(pnl_pct, pct=True))
-        else:
-            t.add_row(str(i), code, pos.get('name', ''), f'{sh:,}',
-                      '[dim]…[/dim]', '', '', '', '')
+    for i, r in enumerate(calc['rows'], 1):
+        gap = (open_gaps or {}).get(r['code'], {}).get('gap_pct')
+        streak, run_pct = _fmt_streak(streaks, r['code'], gap, gap_threshold)
+        if r['price'] is None:
+            t.add_row(str(i), r['code'], r['name'], f"{r['shares']:,}",
+                      '[dim]…[/dim]', '', '', '', '', '', streak, run_pct)
+            continue
+        px = f"{r['price']:,.2f}"
+        if r['stale']:
+            px = f'[dim]{px}[/dim]'          # can't tick — see the note under the table
+        t.add_row(str(i), r['code'], r['name'], f"{r['shares']:,}",
+                  px, _fmt_signed(r['chg_pct'], pct=True),
+                  f"{r['value']:,.0f}", _fmt_signed(r['pnl']),
+                  _fmt_signed(r['pnl_pct'], pct=True), _fmt_signed(r['daily_pnl']),
+                  streak, run_pct)
 
-    if tot_val:
-        pnl = tot_val - tot_cost
+    tot = calc['total']
+    cash = tot.get('cash')            # None unless a cash ledger exists
+    if cash is not None:
+        # Brokerage cash, pinned under the holdings. Never priced, never in P/L.
+        # Peter 2026-10-06: the whole row in bright yellow, every field — the row
+        # style applies to all twelve cells, so it is not a stock row in disguise.
+        t.add_row('', 'CASH', '現金 / 活存餘額', '', '—', '—',
+                  f'{cash:,.0f}', '—', '—', '—', '—', '',
+                  style='bold bright_yellow')
+    if tot['value']:
+        # Say so when the Total covers only part of the book, so a shrunken
+        # figure is never mistaken for the market moving.
+        base = 'Stock Value' if cash is not None else 'Total'
+        label = (base if not calc['n_unpriced']
+                 else f"{base} ({tot['n_priced']}/{tot['n_total']})")
         t.add_section()
-        t.add_row('', '', '[bold]Total[/bold]', '', '',
-                  '', f'[bold]{tot_val:,.0f}[/bold]', _fmt_signed(pnl),
-                  _fmt_signed(pnl / tot_cost * 100 if tot_cost else 0, pct=True))
-    return t
+        t.add_row('', '', f'[bold]{label}[/bold]', '', '',
+                  '', f"[bold]{tot['value']:,.0f}[/bold]", _fmt_signed(tot['pnl']),
+                  _fmt_signed(tot['pnl_pct'], pct=True), _fmt_signed(tot['daily_pnl']),
+                  '', '')
+    if cash is not None:
+        # The second tier: stocks + cash, and the split. P/L above stays stocks-only.
+        nav = (f"[bold]{tot['total_wealth']:,.0f}[/bold]"
+               if tot.get('allocation_valid') else '[dim]—[/dim]')
+        t.add_row('', '', '[bold]Total NAV[/bold]', '', '', '', nav, '', '', '', '', '')
+        if tot.get('allocation_valid'):
+            cap = (f"Allocation: {tot['equity_pct']:.1f}% Stock / {tot['cash_pct']:.1f}% Cash"
+                   f" · cash as of {tot.get('cash_as_of')}")
+        else:
+            cap = (f"Total NAV hidden — {tot['n_total'] - tot['n_priced']} holding(s) have no"
+                   f" quote · cash as of {tot.get('cash_as_of')}")
+        if tot.get('cash_stale'):
+            cap += f" · [yellow]⚠ cash not updated for {tot['cash_age_days']} days[/yellow]"
+        t.caption = cap
+    return t, calc['n_unpriced'], calc['frozen']
 
 
 # ---------------------------------------------------------------------------
@@ -340,8 +393,11 @@ class _Worker(threading.Thread):
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.range_key = '1'                 # currently displayed range
-        self.state = {'quotes': {}, 'quotes_at': None,
-                      'hist': {}, 'compare': None, 'error': '', 'backoff': 1}
+        self.state = {'quotes': {}, 'quotes_at': None, 'quotes_try_at': None,
+                      'hist': {}, 'compare': None, 'error': '', 'backoff': 1,
+                      'daily': None, 'daily_try_at': None, 'streaks': None,
+                      'open_gaps': None, 'open_gaps_try_at': None,
+                      'gap_threshold': open_gap_threshold()}
 
     def set_range(self, key):
         with self.lock:
@@ -381,13 +437,63 @@ class _Worker(threading.Thread):
         backoff = st['backoff']
         quote_ttl = (QUOTE_TTL_OPEN if taiwan_market_open() else QUOTE_TTL_CLOSED) * backoff
 
-        if self._stale(st['quotes_at'], quote_ttl):
+        # Pace off the last ATTEMPT, not the last success. Yahoo returns empty
+        # rather than raising when it throttles, so gating on quotes_at meant a
+        # failed fetch stayed stale and the 2s worker loop retried immediately —
+        # a hot retry storm that guaranteed more throttling while the board sat
+        # frozen with nothing on screen saying so.
+        if self._stale(st['quotes_try_at'], quote_ttl):
+            with self.lock:
+                self.state['quotes_try_at'] = datetime.datetime.now()
             quotes = fetch_live_quotes(list(self.portfolio), self.symbol_map)
             with self.lock:
                 if quotes:
                     self.state['quotes'] = quotes
                     self.state['quotes_at'] = datetime.datetime.now()
                     self.state['error'] = ''
+                else:
+                    self.state['error'] = 'quote fetch returned nothing (throttled?)'
+
+        # Daily closes → Streak / Run% (see DAILY_TTL). Refetch on the open/close
+        # edge too: the streak counts closed sessions only, so today's bar has to
+        # leave the count at 09:00 and join it at 13:30.
+        mkt_open = taiwan_market_open()
+        daily = st['daily']
+        need = (daily is None or daily['open'] != mkt_open
+                or self._stale(daily['at'], DAILY_TTL * backoff))
+        if need and self._stale(st['daily_try_at'], DAILY_RETRY * backoff):
+            with self.lock:
+                self.state['daily_try_at'] = datetime.datetime.now()
+            bars = fetch_history(self.symbol_map.values(), '3mo', '1d')
+            if bars:
+                streaks = {}
+                for code, sym in self.symbol_map.items():
+                    sub = bars.get(sym)
+                    if sub is not None and 'Close' in sub.columns:
+                        # Yahoo drops whole sessions for ETFs (measured 2026-10-02);
+                        # count on closes repaired from the exchange, through the
+                        # last settled session.
+                        streaks[code] = close_streak(
+                            settled_closes(code, sub['Close'], mkt_open), market_open=False)
+                with self.lock:
+                    self.state['daily'] = {'at': datetime.datetime.now(), 'open': mkt_open}
+                    self.state['streaks'] = streaks
+
+        # Today's opening gaps, from the exchange (Yahoo shows yesterday's open
+        # until ~09:20). Asked while the session is open until every holding has
+        # opened, then left alone — an open never changes. The board shows them
+        # only until the 13:30 close, when the count itself absorbs today.
+        if mkt_open:
+            day = datetime.datetime.now(ZoneInfo('Asia/Taipei')).date().isoformat()
+            og = st.get('open_gaps') or {}
+            gaps = og.get('gaps', {}) if og.get('day') == day else {}
+            if (len(gaps) < len(self.portfolio)
+                    and self._stale(st.get('open_gaps_try_at'), OPEN_GAP_RETRY * backoff)):
+                with self.lock:
+                    self.state['open_gaps_try_at'] = datetime.datetime.now()
+                got = opening_gaps(list(self.portfolio))
+                with self.lock:
+                    self.state['open_gaps'] = {'day': day, 'gaps': {**gaps, **got}}
 
         _, period, interval, ttl = RANGES[rkey]
         entry = st['hist'].get(rkey)
@@ -450,8 +556,20 @@ class _Worker(threading.Thread):
 def _hero_line(st, label, page, n_pages):
     """Status line shown at the very top of every page."""
     mkt = '[red]OPEN[/red]' if taiwan_market_open() else '[dim]CLOSED — showing last session[/dim]'
-    at = st['quotes_at'].strftime('%H:%M:%S') if st['quotes_at'] else '—'
-    s = f'market {mkt} · updated {at} · range [bold]{label}[/bold] · page {page+1}/{n_pages}'
+    if st['quotes_at']:
+        # Age, not just a timestamp: the screen repaints 4×/s off cached quotes,
+        # so this is the only thing that says whether the numbers are live.
+        age = int((datetime.datetime.now() - st['quotes_at']).total_seconds())
+        at = st['quotes_at'].strftime('%H:%M:%S') + f' [dim]({age}s ago)[/dim]'
+    else:
+        at = '—'
+    # When we polled ≠ when the exchange last printed. The TW feed is delayed, so
+    # show Yahoo's own quote stamp too — otherwise a fresh poll of a stale price
+    # looks like a live market that isn't moving.
+    stamps = {q['quote_at'] for q in st.get('quotes', {}).values() if q.get('quote_at')}
+    quoted = f' · quote {max(stamps).strftime("%H:%M:%S")}' if stamps else ''
+    s = (f'market {mkt} · updated {at}{quoted} · range [bold]{label}[/bold] · '
+         f'page {page+1}/{n_pages}')
     if st['error']:
         s += f' · [yellow]stale — {st["error"]}[/yellow]'
     return Text.from_markup(s)
@@ -486,25 +604,56 @@ def _search_bar(st, search_mode, search_buf, width):
     return bar
 
 
+_YMODE_TAG = {'linear': '$', 'log': 'log$', 'pct': '%ret'}
+
+
 def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
-                 n_pages, total_cost, search_mode, search_buf):
+                 n_pages, total_cost, search_mode, search_buf, y_mode='linear'):
     entry = st['hist'].get(range_key)
     label = RANGES[range_key][0]
-    w = console.size.width - 4
+    w = console.size.width      # full width, so charts line up with the live table
     H = console.size.height
     parts = [_hero_line(st, label, page, n_pages)]
+    ykeys = f'\\[l] log \\[%] %ret [dim]({_YMODE_TAG[y_mode]})[/dim]'
 
     if page == 0:
-        table = build_live_table(portfolio, st['quotes'])
-        chart_h = max(H - len(portfolio) - 16, 8)
+        og = st.get('open_gaps') or {}
+        today = datetime.datetime.now(ZoneInfo('Asia/Taipei')).date().isoformat()
+        gaps = og.get('gaps') if taiwan_market_open() and og.get('day') == today else None
+        table, n_unpriced, frozen = build_live_table(portfolio, st['quotes'],
+                                                     streaks=st.get('streaks'),
+                                                     open_gaps=gaps,
+                                                     gap_threshold=st.get('gap_threshold', 0.3))
+        notes = []
+        # Only after a fetch has actually landed — before that every holding is
+        # "unpriced" simply because the first cycle hasn't returned yet, and the
+        # warning would fire on every startup.
+        if n_unpriced and st['quotes_at']:
+            notes.append(f'⚠ {n_unpriced} holding(s) have no quote — left out of Total '
+                         f'(both value and cost)')
+        if frozen:
+            notes.append(f'⚠ no intraday feed for {", ".join(frozen)} — priced at last '
+                         f'close, will not move until the next session')
+        if entry and entry['n_flat']:
+            notes.append(f"⚠ {entry['n_flat']} holding(s) shown at last close "
+                         f"(no bars at this interval)")
+        # Reserve a row per note (and one for the legend) so the chart shrinks
+        # instead of scrolling them off.
+        # CASH row + Total NAV row + allocation caption, when a cash ledger exists.
+        cash_rows = 3 if table.caption else 0
+        chart_h = max(H - len(portfolio) - 17 - len(notes) - cash_rows, 8)
         parts.append(candle_renderable(entry['total'], f'Total Portfolio — {label}',
-                                       w, chart_h, hline=total_cost)
+                                       w, chart_h, hline=total_cost, y_mode=y_mode)
                      if entry is not None else Text('fetching…', style='dim'))
         parts.insert(1, table)
-        if entry and entry['n_flat']:
-            parts.append(Text(f"⚠ {entry['n_flat']} holding(s) shown at last close "
-                              f"(no bars at this interval)", style='yellow'))
-        keybar = '[dim]\\[1-7] range  \\[n/p ←/→] page  \\[q] back[/dim]'
+        legend = ('Streak = straight closed sessions up (+) / down (−) · '
+                  'Run% = total move since that run began')
+        if gaps:
+            legend += " · ▲▼ = today's open vs yesterday's close"
+        parts.insert(2, Text(legend, style='dim'))
+        for note in notes:
+            parts.append(Text(note, style='yellow'))
+        keybar = f'[dim]\\[1-7] range  \\[n/p ←/→] page  {ykeys}  \\[q] back[/dim]'
     else:
         code = codes[page - 1]
         pos = portfolio[code]
@@ -512,6 +661,8 @@ def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
         head = f"{code} {pos.get('name','')} — {pos.get('shares',0):,} shares"
         if q:
             head += f" · last {q['price']:,.2f}"
+            if taiwan_market_open() and not q.get('intraday', True):
+                head += ' (last close — no intraday feed)'
         parts.append(Text(head, style='bold cyan'))
 
         # Top half: the holding's graph; bottom half: the compared ticker's.
@@ -519,7 +670,7 @@ def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
         sub = entry['stocks'].get(symbol_map[code]) if entry else None
         parts.append(candle_renderable(
             sub[_OHLC] if sub is not None and not sub.empty else None,
-            f'{code} — {label}', w, h_each)
+            f'{code} — {label}', w, h_each, y_mode=y_mode)
             if entry is not None else Text('fetching…', style='dim'))
 
         parts.append(_search_bar(st, search_mode, search_buf, w))
@@ -530,11 +681,11 @@ def _render_view(console, portfolio, codes, symbol_map, st, range_key, page,
             if centry and centry['df'] is not None and not centry['df'].empty:
                 title = cmp_['input'] + (f' {cmp_["name"]}' if cmp_.get('name') else '')
                 parts.append(candle_renderable(centry['df'][_OHLC],
-                                               f'{title} — {label}', w, h_each))
+                                               f'{title} — {label}', w, h_each, y_mode=y_mode))
             else:
                 parts.append(Text('fetching…', style='dim'))
-        keybar = ('[dim]\\[1-7] range  \\[n/p ←/→] page  \\[/] compare  '
-                  '\\[c] clear  \\[q] back[/dim]')
+        keybar = ('[dim]\\[1-7] range  \\[n/p] page  \\[/] compare  '
+                  f'{ykeys}  \\[c] clear  \\[q] back[/dim]')
 
     parts.append(Text.from_markup(keybar))
     return Group(*parts)
@@ -557,12 +708,13 @@ def graphs_view(console, portfolio, data_dir):
     page, range_key = 0, '1'
     n_pages = 1 + len(codes)
     search_mode, search_buf = False, ''
+    y_mode = 'linear'   # 'linear' $ · 'log' log-$ · 'pct' % from start
 
     def render():
         st, _ = worker.snapshot()
         return _render_view(console, portfolio, codes, symbol_map, st,
                             range_key, page, n_pages, total_cost,
-                            search_mode, search_buf)
+                            search_mode, search_buf, y_mode)
 
     try:
         with _KeyReader() as keys, Live(render(), console=console,
@@ -595,6 +747,10 @@ def graphs_view(console, portfolio, data_dir):
                         search_mode, search_buf = True, ''
                     elif kl == 'c':
                         worker.clear_compare()
+                    elif kl == 'l':          # toggle linear $ ↔ log $
+                        y_mode = 'linear' if y_mode == 'log' else 'log'
+                    elif k == '%':           # toggle % return ↔ $
+                        y_mode = 'linear' if y_mode == 'pct' else 'pct'
                 live.update(render())
                 threading.Event().wait(0.15)
     except KeyboardInterrupt:
